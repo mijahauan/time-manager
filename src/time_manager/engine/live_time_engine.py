@@ -94,6 +94,47 @@ class TimingSolution:
         return json.dumps(asdict(self), indent=2)
 
 
+@dataclass
+class BroadcastCalibration:
+    """
+    Per-broadcast calibration offset learned from data.
+    
+    Each broadcast (station+frequency) has different systematic biases from:
+    - Matched filter group delay
+    - Frequency-dependent ionospheric delays (1/f²)
+    - Detection threshold effects
+    
+    Calibration brings each broadcast's mean D_clock toward 0 (UTC alignment).
+    """
+    station: str              # WWV, WWVH, CHU
+    frequency_mhz: float      # Broadcast frequency
+    offset_ms: float = 0.0    # Calibration offset to apply
+    uncertainty_ms: float = 10.0  # Uncertainty in offset
+    n_samples: int = 0        # Number of samples used for learning
+    last_updated: float = 0.0 # Unix time of last update
+    
+    @property
+    def broadcast_key(self) -> str:
+        """Unique key for this broadcast."""
+        return f"{self.station}_{self.frequency_mhz:.2f}"
+
+
+@dataclass
+class FusionResult:
+    """Result of multi-broadcast D_clock fusion."""
+    d_clock_ms: float              # Fused D_clock (calibrated)
+    d_clock_raw_ms: float          # Uncalibrated mean
+    uncertainty_ms: float          # Weighted std dev
+    n_broadcasts: int              # Number contributing
+    n_outliers_rejected: int       # Outliers removed
+    quality_grade: str             # A/B/C/D
+    
+    # Per-station breakdown
+    wwv_count: int = 0
+    wwvh_count: int = 0
+    chu_count: int = 0
+
+
 @dataclass 
 class ChannelBuffer:
     """
@@ -298,6 +339,18 @@ class LiveTimeEngine:
             'start_time': 0.0
         }
         
+        # Per-broadcast calibration (station+frequency -> offset)
+        self.calibration: Dict[str, BroadcastCalibration] = {}
+        self.calibration_file = Path("/var/lib/grape-recorder/state/broadcast_calibration.json")
+        self._load_calibration()
+        
+        # History for calibration learning (broadcast_key -> list of d_clock values)
+        self.calibration_history: Dict[str, deque] = {}
+        self.calibration_history_max = 100  # Keep last N measurements per broadcast
+        
+        # Last fusion result
+        self.last_fusion: Optional[FusionResult] = None
+        
         logger.info("=" * 60)
         logger.info("LiveTimeEngine initializing")
         logger.info(f"  Multicast: {multicast_address}:{port}")
@@ -397,6 +450,56 @@ class LiveTimeEngine:
         tmp_path.rename(state_path)
         
         logger.debug("State saved to disk")
+    
+    def _load_calibration(self):
+        """Load per-broadcast calibration from disk."""
+        if self.calibration_file.exists():
+            try:
+                with open(self.calibration_file, 'r') as f:
+                    data = json.load(f)
+                
+                for broadcast_key, cal_data in data.items():
+                    # Parse station and frequency from key
+                    parts = broadcast_key.rsplit('_', 1)
+                    station = parts[0] if len(parts) > 1 else broadcast_key
+                    freq = float(parts[1]) if len(parts) > 1 else 0.0
+                    
+                    self.calibration[broadcast_key] = BroadcastCalibration(
+                        station=station,
+                        frequency_mhz=cal_data.get('frequency_mhz', freq),
+                        offset_ms=cal_data.get('offset_ms', 0.0),
+                        uncertainty_ms=cal_data.get('uncertainty_ms', 10.0),
+                        n_samples=cal_data.get('n_samples', 0),
+                        last_updated=cal_data.get('last_updated', 0.0)
+                    )
+                
+                logger.info(f"Loaded {len(self.calibration)} broadcast calibrations")
+            except Exception as e:
+                logger.warning(f"Could not load calibration: {e}")
+    
+    def _save_calibration(self):
+        """Save per-broadcast calibration to disk."""
+        self.calibration_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        data = {}
+        for broadcast_key, cal in self.calibration.items():
+            data[broadcast_key] = {
+                'station': cal.station,
+                'frequency_mhz': cal.frequency_mhz,
+                'offset_ms': cal.offset_ms,
+                'uncertainty_ms': cal.uncertainty_ms,
+                'n_samples': cal.n_samples,
+                'last_updated': cal.last_updated
+            }
+        
+        tmp_path = self.calibration_file.with_suffix('.tmp')
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        tmp_path.rename(self.calibration_file)
+    
+    def _get_broadcast_key(self, station: str, frequency_mhz: float) -> str:
+        """Generate consistent broadcast key for calibration lookups."""
+        return f"{station}_{frequency_mhz:.2f}"
     
     def _publish_shm(self, solution: TimingSolution):
         """Publish timing solution to shared memory."""
@@ -820,49 +923,18 @@ class LiveTimeEngine:
             self.state = EngineState.TRACKING
             logger.info("State transition: ACQUIRING -> TRACKING")
         
-        # Fuse D_clock from ALL broadcasts (up to 13)
+        # Fuse D_clock from ALL broadcasts (up to 13) using improved algorithm
         if results:
-            # Collect all (d_clock, weight) pairs
-            # Weight = confidence * max(snr_db, 1.0) for SNR-aware fusion
-            d_clock_values = []
-            for key, r in results.items():
-                if r['d_clock_ms'] is not None:
-                    snr_weight = max(r['snr_db'], 1.0) if r['snr_db'] > 0 else 1.0
-                    weight = r['confidence'] * snr_weight
-                    d_clock_values.append((key, r['d_clock_ms'], weight))
+            fusion_result = self._fuse_broadcasts(results)
             
-            if len(d_clock_values) >= 3:
-                # Outlier rejection: remove values > 2 std from median
-                d_values = [d for _, d, _ in d_clock_values]
-                median_d = sorted(d_values)[len(d_values) // 2]
-                std_d = (sum((d - median_d)**2 for d in d_values) / len(d_values)) ** 0.5
+            if fusion_result:
+                self.d_clock_ms = fusion_result.d_clock_ms
+                self.d_clock_uncertainty_ms = fusion_result.uncertainty_ms
+                self.last_fusion = fusion_result
                 
-                filtered = [
-                    (key, d, w) for key, d, w in d_clock_values
-                    if abs(d - median_d) < 2 * std_d or std_d < 1.0
-                ]
-                
-                rejected = len(d_clock_values) - len(filtered)
-                if rejected > 0:
-                    logger.info(f"  Outlier rejection: {rejected} broadcasts removed (median={median_d:.2f}ms, std={std_d:.2f}ms)")
-                d_clock_values = filtered if filtered else d_clock_values
-            
-            if d_clock_values:
-                # Weighted average
-                total_weight = sum(w for _, _, w in d_clock_values)
-                if total_weight > 0:
-                    fused_d_clock = sum(d * w for _, d, w in d_clock_values) / total_weight
-                    self.d_clock_ms = fused_d_clock
-                    
-                    # Uncertainty estimate from spread
-                    if len(d_clock_values) > 1:
-                        d_values = [d for _, d, _ in d_clock_values]
-                        spread = max(d_values) - min(d_values)
-                        self.d_clock_uncertainty_ms = spread / (2 * len(d_clock_values) ** 0.5)
-                    else:
-                        self.d_clock_uncertainty_ms = 5.0
-                    
-                    logger.info(f"  Slow Loop fused: D_clock={self.d_clock_ms:+.2f}ms ±{self.d_clock_uncertainty_ms:.2f}ms from {len(d_clock_values)} broadcasts")
+                logger.info(f"  Slow Loop fused: D_clock={fusion_result.d_clock_ms:+.3f}ms "
+                           f"±{fusion_result.uncertainty_ms:.3f}ms from {fusion_result.n_broadcasts} broadcasts "
+                           f"[grade {fusion_result.quality_grade}]")
         
         # Create and publish timing solution
         if results:
@@ -979,6 +1051,211 @@ class LiveTimeEngine:
             }
         
         return broadcasts
+    
+    def _fuse_broadcasts(self, results: Dict[str, Dict]) -> Optional[FusionResult]:
+        """
+        Fuse D_clock from all broadcasts using improved algorithm.
+        
+        Implements:
+        1. Per-broadcast calibration with EMA learning
+        2. Weight calculation (grade × mode × SNR)
+        3. MAD-based outlier rejection
+        4. Quality grading
+        
+        Args:
+            results: Dict of broadcast results with d_clock_ms, station, etc.
+            
+        Returns:
+            FusionResult with fused D_clock and quality metrics
+        """
+        if not results:
+            return None
+        
+        # Weight factors from previous grape-recorder
+        GRADE_WEIGHTS = {'A': 1.0, 'B': 0.8, 'C': 0.5, 'D': 0.2}
+        MODE_WEIGHTS = {
+            '1E': 1.0, '1F': 0.9, '2F': 0.7, '3F': 0.5, 'GW': 1.0,
+            '2E': 0.85, '3E': 0.6, 'UNKNOWN': 0.3
+        }
+        
+        # Collect measurements with weights
+        measurements = []  # [(broadcast_key, d_clock_raw, d_clock_calibrated, weight, station)]
+        
+        for broadcast_key, r in results.items():
+            if r['d_clock_ms'] is None:
+                continue
+            
+            station = r.get('station', 'UNKNOWN')
+            freq_mhz = r.get('frequency_mhz', 0.0)
+            if freq_mhz == 0.0:
+                # Parse from broadcast_key (e.g., "WWV 10 MHz" or "WWV 10.0 MHz")
+                try:
+                    parts = broadcast_key.split()
+                    freq_mhz = float(parts[1])
+                except:
+                    freq_mhz = 10.0
+            
+            d_clock_raw = r['d_clock_ms']
+            
+            # Apply calibration
+            cal_key = self._get_broadcast_key(station, freq_mhz)
+            cal = self.calibration.get(cal_key)
+            if cal and cal.n_samples > 10:
+                d_clock_calibrated = d_clock_raw + cal.offset_ms
+            else:
+                d_clock_calibrated = d_clock_raw
+            
+            # Calculate weight
+            confidence = r.get('confidence', 0.5)
+            mode = r.get('propagation_mode', 'UNKNOWN')
+            snr_db = r.get('snr_db', 0.0)
+            grade = r.get('quality_grade', 'C')
+            
+            # Weight = confidence × grade × mode × SNR_factor
+            grade_w = GRADE_WEIGHTS.get(grade, 0.2)
+            mode_w = MODE_WEIGHTS.get(mode, 0.5)
+            
+            if snr_db > 10:
+                snr_w = 1.0
+            elif snr_db > 5:
+                snr_w = 0.8
+            elif snr_db > 0:
+                snr_w = 0.5
+            else:
+                snr_w = 0.3
+            
+            weight = max(0.01, confidence * grade_w * mode_w * snr_w)
+            
+            measurements.append((broadcast_key, d_clock_raw, d_clock_calibrated, weight, station, freq_mhz))
+            
+            # Update calibration history
+            if cal_key not in self.calibration_history:
+                self.calibration_history[cal_key] = deque(maxlen=self.calibration_history_max)
+            self.calibration_history[cal_key].append(d_clock_raw)
+        
+        if len(measurements) < 2:
+            return None
+        
+        # MAD-based outlier rejection
+        d_calibrated = np.array([m[2] for m in measurements])
+        weights = np.array([m[3] for m in measurements])
+        
+        n_rejected = 0
+        if len(measurements) >= 4:
+            # Weighted median
+            sorted_idx = np.argsort(d_calibrated)
+            sorted_d = d_calibrated[sorted_idx]
+            sorted_w = weights[sorted_idx]
+            cumsum = np.cumsum(sorted_w)
+            median_idx = np.searchsorted(cumsum, cumsum[-1] / 2)
+            weighted_median = sorted_d[min(median_idx, len(sorted_d)-1)]
+            
+            # MAD (Median Absolute Deviation) × 1.4826 to scale to std
+            deviations = np.abs(d_calibrated - weighted_median)
+            mad = np.median(deviations) * 1.4826
+            
+            if mad < 0.1:
+                mad = 0.1  # Minimum to avoid division by zero
+            
+            # Reject outliers > 3 MAD
+            keep_mask = deviations < (3.0 * mad)
+            
+            if np.sum(keep_mask) >= 2:
+                n_rejected = len(measurements) - np.sum(keep_mask)
+                if n_rejected > 0:
+                    logger.info(f"  MAD outlier rejection: {n_rejected} broadcasts "
+                               f"(median={weighted_median:.2f}ms, MAD={mad:.2f}ms)")
+                measurements = [m for m, keep in zip(measurements, keep_mask) if keep]
+                d_calibrated = np.array([m[2] for m in measurements])
+                weights = np.array([m[3] for m in measurements])
+        
+        # Weighted mean
+        total_weight = np.sum(weights)
+        if total_weight <= 0:
+            return None
+        
+        fused_d_clock = np.sum(weights * d_calibrated) / total_weight
+        
+        # Raw (uncalibrated) mean
+        d_raw = np.array([m[1] for m in measurements])
+        raw_mean = np.mean(d_raw)
+        
+        # Weighted standard deviation
+        weighted_var = np.sum(weights * (d_calibrated - fused_d_clock)**2) / total_weight
+        uncertainty = np.sqrt(weighted_var) if weighted_var > 0 else 1.0
+        
+        # Station counts
+        stations = [m[4] for m in measurements]
+        wwv_count = sum(1 for s in stations if s == 'WWV')
+        wwvh_count = sum(1 for s in stations if s == 'WWVH')
+        chu_count = sum(1 for s in stations if s == 'CHU')
+        
+        # Quality grade (from grape-recorder)
+        n_broadcasts = len(measurements)
+        if n_broadcasts >= 8 and uncertainty < 0.5:
+            grade = 'A'
+        elif n_broadcasts >= 5 and uncertainty < 1.0:
+            grade = 'B'
+        elif n_broadcasts >= 3 and uncertainty < 2.0:
+            grade = 'C'
+        else:
+            grade = 'D'
+        
+        # Update calibration (EMA learning)
+        self._update_calibration(measurements)
+        
+        return FusionResult(
+            d_clock_ms=fused_d_clock,
+            d_clock_raw_ms=raw_mean,
+            uncertainty_ms=uncertainty,
+            n_broadcasts=n_broadcasts,
+            n_outliers_rejected=n_rejected,
+            quality_grade=grade,
+            wwv_count=wwv_count,
+            wwvh_count=wwvh_count,
+            chu_count=chu_count
+        )
+    
+    def _update_calibration(self, measurements: List):
+        """
+        Update per-broadcast calibration using EMA.
+        
+        Calibration offset brings mean D_clock toward 0 (UTC alignment).
+        Uses exponential moving average with α = max(0.5, 20/n_samples).
+        """
+        for broadcast_key, d_clock_raw, _, _, station, freq_mhz in measurements:
+            cal_key = self._get_broadcast_key(station, freq_mhz)
+            history = self.calibration_history.get(cal_key)
+            
+            if not history or len(history) < 10:
+                continue
+            
+            # Recent measurements
+            recent = list(history)[-30:]
+            mean_d_clock = np.mean(recent)
+            std_d_clock = np.std(recent) if len(recent) > 1 else 1.0
+            
+            # New offset should bring mean to 0
+            new_offset = -mean_d_clock
+            
+            # EMA update
+            old_cal = self.calibration.get(cal_key)
+            if old_cal and old_cal.n_samples > 0:
+                alpha = max(0.5, 20.0 / old_cal.n_samples)
+                new_offset = alpha * new_offset + (1 - alpha) * old_cal.offset_ms
+            
+            self.calibration[cal_key] = BroadcastCalibration(
+                station=station,
+                frequency_mhz=freq_mhz,
+                offset_ms=new_offset,
+                uncertainty_ms=std_d_clock,
+                n_samples=len(history),
+                last_updated=time.time()
+            )
+        
+        # Save periodically (every 10 updates)
+        if sum(c.n_samples for c in self.calibration.values()) % 10 == 0:
+            self._save_calibration()
     
     def _update_chrony(self):
         """Update Chrony SHM with current D_clock."""
