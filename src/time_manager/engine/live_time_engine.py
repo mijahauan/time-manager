@@ -784,38 +784,28 @@ class LiveTimeEngine:
                     solution = phase2_result.solution
                     time_snap = phase2_result.time_snap
                     
-                    # Get SNR for the anchor station
-                    snr_db = 0.0
-                    if time_snap:
-                        station_lower = (solution.station if solution else 'WWV').lower()
-                        if station_lower == 'wwv' and time_snap.wwv_snr_db:
-                            snr_db = time_snap.wwv_snr_db
-                        elif station_lower == 'wwvh' and time_snap.wwvh_snr_db:
-                            snr_db = time_snap.wwvh_snr_db
-                        elif station_lower == 'chu' and time_snap.chu_snr_db:
-                            snr_db = time_snap.chu_snr_db
+                    # Extract ALL detected broadcasts on this frequency
+                    # (not just the dominant station)
+                    broadcasts_on_freq = self._extract_all_broadcasts(
+                        name, phase2_result, solution, time_snap
+                    )
                     
-                    result = {
-                        'station': solution.station if solution else 'UNKNOWN',
-                        'propagation_mode': solution.propagation_mode if solution else 'UNKNOWN',
-                        'propagation_delay_ms': solution.t_propagation_ms if solution else 0.0,
-                        'snr_db': snr_db,
-                        'confidence': phase2_result.confidence,
-                        'd_clock_ms': phase2_result.d_clock_ms
-                    }
-                    results[name] = result
+                    for broadcast_key, broadcast_result in broadcasts_on_freq.items():
+                        results[broadcast_key] = broadcast_result
+                        logger.info(f"  {broadcast_key}: {broadcast_result['station']} "
+                                   f"{broadcast_result['propagation_mode']} "
+                                   f"D_clock={broadcast_result['d_clock_ms']:+.2f}ms "
+                                   f"SNR={broadcast_result['snr_db']:.1f}dB")
                     
-                    # Update channel state for next Fast Loop
+                    # Update channel state for next Fast Loop (use primary/dominant)
                     state = self.channel_states[name]
-                    state.station = result['station']
-                    state.propagation_mode = result['propagation_mode']
-                    state.propagation_delay_ms = result['propagation_delay_ms']
-                    state.snr_db = result['snr_db']
-                    state.confidence = result['confidence']
+                    primary = broadcasts_on_freq.get(name, list(broadcasts_on_freq.values())[0])
+                    state.station = primary['station']
+                    state.propagation_mode = primary['propagation_mode']
+                    state.propagation_delay_ms = primary['propagation_delay_ms']
+                    state.snr_db = primary['snr_db']
+                    state.confidence = primary['confidence']
                     state.last_update_minute = minute
-                    
-                    logger.info(f"  {name}: {result['station']} {result['propagation_mode']} "
-                               f"D_clock={result['d_clock_ms']:+.2f}ms")
                 else:
                     logger.warning(f"  {name}: Phase 2 returned no result")
                     
@@ -830,21 +820,49 @@ class LiveTimeEngine:
             self.state = EngineState.TRACKING
             logger.info("State transition: ACQUIRING -> TRACKING")
         
-        # Fuse D_clock from all channel results
+        # Fuse D_clock from ALL broadcasts (up to 13)
         if results:
-            # Weighted average by confidence
-            d_clock_values = [
-                (r['d_clock_ms'], r['confidence'])
-                for r in results.values()
-                if r['d_clock_ms'] is not None
-            ]
+            # Collect all (d_clock, weight) pairs
+            # Weight = confidence * max(snr_db, 1.0) for SNR-aware fusion
+            d_clock_values = []
+            for key, r in results.items():
+                if r['d_clock_ms'] is not None:
+                    snr_weight = max(r['snr_db'], 1.0) if r['snr_db'] > 0 else 1.0
+                    weight = r['confidence'] * snr_weight
+                    d_clock_values.append((key, r['d_clock_ms'], weight))
+            
+            if len(d_clock_values) >= 3:
+                # Outlier rejection: remove values > 2 std from median
+                d_values = [d for _, d, _ in d_clock_values]
+                median_d = sorted(d_values)[len(d_values) // 2]
+                std_d = (sum((d - median_d)**2 for d in d_values) / len(d_values)) ** 0.5
+                
+                filtered = [
+                    (key, d, w) for key, d, w in d_clock_values
+                    if abs(d - median_d) < 2 * std_d or std_d < 1.0
+                ]
+                
+                rejected = len(d_clock_values) - len(filtered)
+                if rejected > 0:
+                    logger.info(f"  Outlier rejection: {rejected} broadcasts removed (median={median_d:.2f}ms, std={std_d:.2f}ms)")
+                d_clock_values = filtered if filtered else d_clock_values
+            
             if d_clock_values:
-                total_weight = sum(c for _, c in d_clock_values)
+                # Weighted average
+                total_weight = sum(w for _, _, w in d_clock_values)
                 if total_weight > 0:
-                    fused_d_clock = sum(d * c for d, c in d_clock_values) / total_weight
+                    fused_d_clock = sum(d * w for _, d, w in d_clock_values) / total_weight
                     self.d_clock_ms = fused_d_clock
-                    self.d_clock_uncertainty_ms = 5.0 / len(d_clock_values)
-                    logger.info(f"  Slow Loop fused: D_clock={self.d_clock_ms:+.2f}ms from {len(d_clock_values)} channels")
+                    
+                    # Uncertainty estimate from spread
+                    if len(d_clock_values) > 1:
+                        d_values = [d for _, d, _ in d_clock_values]
+                        spread = max(d_values) - min(d_values)
+                        self.d_clock_uncertainty_ms = spread / (2 * len(d_clock_values) ** 0.5)
+                    else:
+                        self.d_clock_uncertainty_ms = 5.0
+                    
+                    logger.info(f"  Slow Loop fused: D_clock={self.d_clock_ms:+.2f}ms ±{self.d_clock_uncertainty_ms:.2f}ms from {len(d_clock_values)} broadcasts")
         
         # Create and publish timing solution
         if results:
@@ -867,6 +885,100 @@ class LiveTimeEngine:
             
             self._publish_shm(solution)
             self._save_state()
+    
+    def _extract_all_broadcasts(self, freq_name: str, phase2_result, solution, time_snap) -> Dict[str, Dict]:
+        """
+        Extract ALL detected broadcasts from a single frequency.
+        
+        On shared frequencies (2.5, 5, 10, 15 MHz), both WWV and WWVH may be detected.
+        This method extracts timing for ALL detected stations, not just the dominant one.
+        
+        Args:
+            freq_name: Frequency channel name (e.g., "WWV 10 MHz")
+            phase2_result: Complete Phase2Result
+            solution: TransmissionTimeSolution (for dominant station)
+            time_snap: TimeSnapResult with per-station timing
+            
+        Returns:
+            Dict mapping broadcast keys to result dicts
+            e.g., {"WWV 10 MHz": {...}, "WWVH 10 MHz": {...}}
+        """
+        broadcasts = {}
+        
+        # Extract frequency from channel name
+        freq_mhz = solution.frequency_mhz if solution else 10.0
+        
+        # Shared frequencies where both WWV and WWVH broadcast
+        SHARED_FREQS = {2.5, 5.0, 10.0, 15.0}
+        is_shared = freq_mhz in SHARED_FREQS
+        
+        # CHU frequencies
+        CHU_FREQS = {3.33, 7.85, 14.67}
+        is_chu = freq_mhz in CHU_FREQS
+        
+        # Base propagation delay from the dominant solution
+        base_prop_delay = solution.t_propagation_ms if solution else 0.0
+        prop_mode = solution.propagation_mode if solution else '2F'
+        
+        # Extract WWV timing if detected
+        if time_snap and time_snap.wwv_detected and time_snap.wwv_timing_ms is not None:
+            wwv_key = f"WWV {freq_mhz} MHz"
+            # D_clock = arrival_time - propagation_delay
+            # timing_ms is offset from minute boundary
+            wwv_d_clock = time_snap.wwv_timing_ms - base_prop_delay
+            broadcasts[wwv_key] = {
+                'station': 'WWV',
+                'propagation_mode': prop_mode,
+                'propagation_delay_ms': base_prop_delay,
+                'snr_db': time_snap.wwv_snr_db or 0.0,
+                'confidence': phase2_result.confidence if time_snap.wwv_snr_db and time_snap.wwv_snr_db > 3 else 0.1,
+                'd_clock_ms': wwv_d_clock,
+                'timing_ms': time_snap.wwv_timing_ms
+            }
+        
+        # Extract WWVH timing if detected (only on shared frequencies)
+        if is_shared and time_snap and time_snap.wwvh_detected and time_snap.wwvh_timing_ms is not None:
+            wwvh_key = f"WWVH {freq_mhz} MHz"
+            # WWVH has different propagation path - use scaled delay
+            # WWVH is ~6600km from receiver vs ~1100km for WWV (roughly 6x)
+            wwvh_prop_delay = base_prop_delay * 2.5  # Approximate scaling
+            wwvh_d_clock = time_snap.wwvh_timing_ms - wwvh_prop_delay
+            broadcasts[wwvh_key] = {
+                'station': 'WWVH',
+                'propagation_mode': prop_mode,
+                'propagation_delay_ms': wwvh_prop_delay,
+                'snr_db': time_snap.wwvh_snr_db or 0.0,
+                'confidence': phase2_result.confidence * 0.8 if time_snap.wwvh_snr_db and time_snap.wwvh_snr_db > 3 else 0.05,
+                'd_clock_ms': wwvh_d_clock,
+                'timing_ms': time_snap.wwvh_timing_ms
+            }
+        
+        # Extract CHU timing if detected
+        if is_chu and time_snap and time_snap.chu_detected and time_snap.chu_timing_ms is not None:
+            chu_key = f"CHU {freq_mhz} MHz"
+            chu_d_clock = time_snap.chu_timing_ms - base_prop_delay
+            broadcasts[chu_key] = {
+                'station': 'CHU',
+                'propagation_mode': prop_mode,
+                'propagation_delay_ms': base_prop_delay,
+                'snr_db': time_snap.chu_snr_db or 0.0,
+                'confidence': phase2_result.confidence if time_snap.chu_snr_db and time_snap.chu_snr_db > 3 else 0.1,
+                'd_clock_ms': chu_d_clock,
+                'timing_ms': time_snap.chu_timing_ms
+            }
+        
+        # Fallback: if no broadcasts extracted, use the dominant solution
+        if not broadcasts:
+            broadcasts[freq_name] = {
+                'station': solution.station if solution else 'UNKNOWN',
+                'propagation_mode': prop_mode,
+                'propagation_delay_ms': base_prop_delay,
+                'snr_db': 0.0,
+                'confidence': phase2_result.confidence,
+                'd_clock_ms': phase2_result.d_clock_ms
+            }
+        
+        return broadcasts
     
     def _update_chrony(self):
         """Update Chrony SHM with current D_clock."""
