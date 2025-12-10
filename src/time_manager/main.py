@@ -697,6 +697,22 @@ Examples:
         '--channel',
         help='Process only this channel (e.g., "WWV 10 MHz")'
     )
+    parser.add_argument(
+        '--live',
+        action='store_true',
+        help='Run in live mode (subscribe to RTP multicast, Twin-Stream architecture)'
+    )
+    parser.add_argument(
+        '--multicast',
+        default='239.1.2.82',
+        help='RTP multicast address (default: 239.1.2.82)'
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=5004,
+        help='RTP port (default: 5004)'
+    )
     
     args = parser.parse_args()
     
@@ -712,15 +728,65 @@ Examples:
     if args.enable_chrony:
         config.setdefault('output', {})['enable_chrony'] = True
     
-    # Create and start daemon
-    daemon = TimeManagerDaemon(config, data_root=args.data_root)
+    if args.live:
+        # Live mode: Twin-Stream architecture with RTP subscription
+        from .engine.live_time_engine import LiveTimeEngine
+        
+        # Build channel list - auto-discover if SSRCs not configured
+        channels = []
+        channels_config = config.get('channels', {})
+        if isinstance(channels_config, dict):
+            channel_names = channels_config.get('enabled', [])
+            ssrc_map = channels_config.get('ssrc', {})
+        else:
+            channel_names = channels_config if isinstance(channels_config, list) else []
+            ssrc_map = {}
+        
+        # Only use channels with configured SSRCs
+        for name in channel_names:
+            ssrc = ssrc_map.get(name, 0)
+            if ssrc:
+                # Extract frequency from channel name
+                parts = name.split()
+                freq_mhz = float(parts[1])
+                channels.append({
+                    'name': name,
+                    'ssrc': ssrc,
+                    'frequency_hz': freq_mhz * 1e6
+                })
+        
+        # If no SSRCs configured, engine will auto-discover from radiod
+        if not channels:
+            logger.info("No SSRCs configured - will auto-discover from radiod")
+        
+        # Get receiver config
+        receiver_config = config.get('receiver', {})
+        
+        engine = LiveTimeEngine(
+            multicast_address=args.multicast,
+            port=args.port,
+            channels=channels,
+            sample_rate=config.get('general', {}).get('sample_rate', 20000),
+            receiver_grid=receiver_config.get('grid_square', 'EM38ww'),
+            receiver_lat=receiver_config.get('latitude'),
+            receiver_lon=receiver_config.get('longitude'),
+            enable_chrony=args.enable_chrony or config.get('output', {}).get('enable_chrony', False),
+            chrony_unit=config.get('output', {}).get('chrony_unit', 0)
+        )
+        
+        engine.run()
     
-    if args.reprocess:
+    elif args.reprocess:
+        # Reprocess mode: Read from disk files
+        daemon = TimeManagerDaemon(config, data_root=args.data_root)
         daemon.reprocess(
             num_minutes=args.minutes,
             channel_filter=args.channel
         )
+    
     else:
+        # Daemon mode: Poll for new disk files
+        daemon = TimeManagerDaemon(config, data_root=args.data_root)
         daemon.start()
 
 
