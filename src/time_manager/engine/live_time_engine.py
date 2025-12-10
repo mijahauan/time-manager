@@ -830,6 +830,22 @@ class LiveTimeEngine:
             self.state = EngineState.TRACKING
             logger.info("State transition: ACQUIRING -> TRACKING")
         
+        # Fuse D_clock from all channel results
+        if results:
+            # Weighted average by confidence
+            d_clock_values = [
+                (r['d_clock_ms'], r['confidence'])
+                for r in results.values()
+                if r['d_clock_ms'] is not None
+            ]
+            if d_clock_values:
+                total_weight = sum(c for _, c in d_clock_values)
+                if total_weight > 0:
+                    fused_d_clock = sum(d * c for d, c in d_clock_values) / total_weight
+                    self.d_clock_ms = fused_d_clock
+                    self.d_clock_uncertainty_ms = 5.0 / len(d_clock_values)
+                    logger.info(f"  Slow Loop fused: D_clock={self.d_clock_ms:+.2f}ms from {len(d_clock_values)} channels")
+        
         # Create and publish timing solution
         if results:
             solution = TimingSolution(
