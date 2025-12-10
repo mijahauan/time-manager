@@ -713,6 +713,11 @@ Examples:
         default=5004,
         help='RTP port (default: 5004)'
     )
+    parser.add_argument(
+        '--status-addr',
+        default='radiod.local',
+        help='Radiod status multicast address for channel discovery (default: radiod.local)'
+    )
     
     args = parser.parse_args()
     
@@ -771,7 +776,8 @@ Examples:
             receiver_lat=receiver_config.get('latitude'),
             receiver_lon=receiver_config.get('longitude'),
             enable_chrony=args.enable_chrony or config.get('output', {}).get('enable_chrony', False),
-            chrony_unit=config.get('output', {}).get('chrony_unit', 0)
+            chrony_unit=config.get('output', {}).get('chrony_unit', 0),
+            status_address=args.status_addr
         )
         
         engine.run()

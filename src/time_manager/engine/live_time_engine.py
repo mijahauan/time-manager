@@ -231,7 +231,8 @@ class LiveTimeEngine:
         receiver_lat: float = None,
         receiver_lon: float = None,
         enable_chrony: bool = False,
-        chrony_unit: int = 0
+        chrony_unit: int = 0,
+        status_address: str = "radiod.local"
     ):
         """
         Initialize live time engine.
@@ -246,10 +247,12 @@ class LiveTimeEngine:
             receiver_lon: Precise longitude
             enable_chrony: Enable Chrony SHM output
             chrony_unit: Chrony SHM unit number
+            status_address: Radiod status multicast for channel discovery
         """
         self.multicast_address = multicast_address
         self.port = port
         self.sample_rate = sample_rate
+        self.status_address = status_address
         self.receiver_grid = receiver_grid
         self.receiver_lat = receiver_lat
         self.receiver_lon = receiver_lon
@@ -450,31 +453,41 @@ class LiveTimeEngine:
             # discover_channels returns Dict[ssrc, ChannelInfo]
             logger.info(f"  Found {len(discovered)} channels")
             
-            # Map descriptions to our channel naming convention
+            # Map frequencies to channel names
+            # Known time signal frequencies
+            FREQ_TO_STATION = {
+                2500000: "WWV 2.5 MHz",
+                3330000: "CHU 3.33 MHz",
+                5000000: "WWV 5 MHz",
+                7850000: "CHU 7.85 MHz",
+                10000000: "WWV 10 MHz",
+                14670000: "CHU 14.67 MHz",
+                15000000: "WWV 15 MHz",
+                20000000: "WWV 20 MHz",
+                25000000: "WWV 25 MHz",
+            }
+            
             for ssrc_key, ch_info in discovered.items():
-                # ka9q provides: ssrc, frequency, description, etc.
-                desc = getattr(ch_info, 'description', '') or ''
                 freq = getattr(ch_info, 'frequency', 0)
                 ssrc = ssrc_key  # SSRC is the dict key
                 
-                # Build channel name from description or frequency
-                if desc:
-                    name = desc
-                elif freq:
-                    freq_mhz = freq / 1e6
-                    name = f"Channel {freq_mhz:.2f} MHz"
-                else:
+                # Look up channel name from frequency
+                # Round to nearest kHz for matching
+                freq_rounded = round(freq / 1000) * 1000
+                name = FREQ_TO_STATION.get(freq_rounded)
+                
+                if not name:
+                    # Not a known time signal frequency
+                    logger.debug(f"  Skipping unknown frequency: {freq/1e6:.3f} MHz")
                     continue
                 
-                # Filter to time signal channels
-                if any(x in name.upper() for x in ['WWV', 'CHU']):
-                    channels.append({
-                        'name': name,
-                        'ssrc': ssrc,
-                        'frequency_hz': freq,
-                        'channel_info': ch_info  # Keep for timing
-                    })
-                    logger.info(f"  Discovered: {name} (SSRC={ssrc}, freq={freq/1e6:.2f} MHz)")
+                channels.append({
+                    'name': name,
+                    'ssrc': ssrc,
+                    'frequency_hz': freq,
+                    'channel_info': ch_info  # Keep for timing
+                })
+                logger.info(f"  Discovered: {name} (SSRC={ssrc})")
             
             return channels
             
@@ -492,7 +505,7 @@ class LiveTimeEngine:
         # If no channels configured, try to discover them
         if not self.channels:
             logger.info("No channels configured, discovering from radiod...")
-            self.channels = self._discover_channels()
+            self.channels = self._discover_channels(self.status_address)
             
             if not self.channels:
                 logger.error("No channels discovered - is radiod running?")
