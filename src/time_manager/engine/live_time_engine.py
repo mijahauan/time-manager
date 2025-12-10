@@ -430,9 +430,12 @@ class LiveTimeEngine:
         
         return callback
     
-    def _discover_channels(self) -> List[Dict[str, Any]]:
+    def _discover_channels(self, status_address: str = "radiod.local") -> List[Dict[str, Any]]:
         """
         Discover available channels from radiod using ka9q.
+        
+        Args:
+            status_address: Multicast address for radiod status (default: radiod.local)
         
         Returns:
             List of channel configs with name, ssrc, frequency_hz
@@ -440,15 +443,19 @@ class LiveTimeEngine:
         try:
             from ka9q import discover_channels
             
-            discovered = discover_channels(timeout=5.0)
+            logger.info(f"  Discovering channels from {status_address}...")
+            discovered = discover_channels(status_address, listen_duration=3.0)
             channels = []
             
+            # discover_channels returns Dict[ssrc, ChannelInfo]
+            logger.info(f"  Found {len(discovered)} channels")
+            
             # Map descriptions to our channel naming convention
-            for ch_info in discovered:
+            for ssrc_key, ch_info in discovered.items():
                 # ka9q provides: ssrc, frequency, description, etc.
                 desc = getattr(ch_info, 'description', '') or ''
                 freq = getattr(ch_info, 'frequency', 0)
-                ssrc = getattr(ch_info, 'ssrc', 0)
+                ssrc = ssrc_key  # SSRC is the dict key
                 
                 # Build channel name from description or frequency
                 if desc:
@@ -489,7 +496,8 @@ class LiveTimeEngine:
             
             if not self.channels:
                 logger.error("No channels discovered - is radiod running?")
-                return
+                logger.error("Check: systemctl status radiod")
+                raise RuntimeError("No channels discovered from radiod")
             
             # Re-initialize buffers for discovered channels
             self._init_channel_buffers()
