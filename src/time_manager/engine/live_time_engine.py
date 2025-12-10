@@ -588,6 +588,11 @@ class LiveTimeEngine:
         """
         logger.info(f"Fast Loop: minute {minute}")
         
+        # Log buffer stats
+        total_samples = sum(b.ring_write_pos for b in self.channel_buffers.values())
+        total_packets = sum(b.packets_received for b in self.channel_buffers.values())
+        logger.info(f"  Buffer stats: {total_samples} samples, {total_packets} packets across {len(self.channel_buffers)} channels")
+        
         # Skip if still acquiring
         if self.state == EngineState.ACQUIRING:
             logger.info("  Skipping (still acquiring)")
