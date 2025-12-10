@@ -1,0 +1,13 @@
+numpy>=1.20.0
+scipy>=1.7.0
+toml>=0.10.0
+
+[chrony]
+sysv_ipc>=1.1.0
+
+[dev]
+pytest-cov>=3.0.0
+pytest>=7.0.0
+
+[zmq]
+pyzmq>=22.0.0

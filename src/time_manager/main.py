@@ -91,20 +91,36 @@ class TimeManagerDaemon:
             data_root: Override data root path (for testing)
         """
         self.config = config
-        self.data_root = Path(data_root or config.get('data_root', '/tmp/grape-test'))
+        # data_root can be at top level or under [general]
+        default_data_root = config.get('general', {}).get('data_root', 
+                           config.get('data_root', '/tmp/grape-test'))
+        self.data_root = Path(data_root or default_data_root)
         
         # Channels to process
-        self.channels = config.get('channels', [
-            'WWV 2.5 MHz', 'WWV 5 MHz', 'WWV 10 MHz', 'WWV 15 MHz',
-            'WWV 20 MHz', 'WWV 25 MHz',
-            'CHU 3.33 MHz', 'CHU 7.85 MHz', 'CHU 14.67 MHz'
-        ])
+        # Config can have channels as list or as [channels].enabled
+        channels_config = config.get('channels', [])
+        if isinstance(channels_config, dict):
+            self.channels = channels_config.get('enabled', [])
+        elif isinstance(channels_config, list):
+            self.channels = channels_config
+        else:
+            self.channels = []
+        
+        # Default channels if none configured
+        if not self.channels:
+            self.channels = [
+                'WWV 2.5 MHz', 'WWV 5 MHz', 'WWV 10 MHz', 'WWV 15 MHz',
+                'WWV 20 MHz', 'WWV 25 MHz',
+                'CHU 3.33 MHz', 'CHU 7.85 MHz', 'CHU 14.67 MHz'
+            ]
         
         # Receiver configuration
         self.receiver_grid = config.get('receiver', {}).get('grid_square', 'EM38ww')
         self.receiver_lat = config.get('receiver', {}).get('latitude')
         self.receiver_lon = config.get('receiver', {}).get('longitude')
-        self.sample_rate = config.get('sample_rate', 20000)
+        # sample_rate can be at top level or under [general]
+        self.sample_rate = config.get('general', {}).get('sample_rate',
+                          config.get('sample_rate', 20000))
         
         # Output configuration
         self.shm_path = config.get('output', {}).get('shm_path', '/dev/shm/grape_timing')
@@ -299,12 +315,11 @@ class TimeManagerDaemon:
                 return None
             
             # Find the file for this minute
-            minute_file = None
-            for f in raw_buffer_dir.glob(f"{minute_ts}_*.bin"):
-                minute_file = f
-                break
+            # Files are named {unix_timestamp}.bin (e.g., 1765338300.bin)
+            minute_file = raw_buffer_dir / f"{minute_ts}.bin"
             
-            if not minute_file or not minute_file.exists():
+            if not minute_file.exists():
+                logger.debug(f"{channel_name}: File not found: {minute_file}")
                 return None
             
             # Load the binary file
@@ -469,6 +484,130 @@ class TimeManagerDaemon:
         
         logger.info(f"Processed {self.minutes_processed} minutes")
         logger.info("time-manager stopped")
+    
+    def reprocess(
+        self,
+        num_minutes: int = 10,
+        channel_filter: Optional[str] = None
+    ):
+        """
+        Reprocess historical data instead of polling for new data.
+        
+        This mode discovers existing minute files and processes them,
+        useful for testing and batch reprocessing.
+        
+        Args:
+            num_minutes: Maximum number of minutes to process
+            channel_filter: If set, only process this channel
+        """
+        logger.info("=" * 60)
+        logger.info("REPROCESS MODE")
+        logger.info(f"  Data root: {self.data_root}")
+        logger.info(f"  Max minutes: {num_minutes}")
+        logger.info(f"  Channel filter: {channel_filter or 'all'}")
+        logger.info("=" * 60)
+        
+        self.running = True
+        self.start_time = time.time()
+        
+        # Initialize engines
+        self._init_channel_engines()
+        
+        # Filter channels if requested
+        if channel_filter:
+            if channel_filter not in self.channel_engines:
+                logger.error(f"Channel '{channel_filter}' not found. Available: {list(self.channel_engines.keys())}")
+                return
+            engines_to_process = {channel_filter: self.channel_engines[channel_filter]}
+        else:
+            engines_to_process = self.channel_engines
+        
+        # Discover available minute files
+        from grape_recorder.paths import channel_name_to_dir
+        
+        all_minutes: Dict[str, List[int]] = {}
+        
+        for channel_name in engines_to_process.keys():
+            channel_dir = channel_name_to_dir(channel_name)
+            raw_buffer_path = self.data_root / 'raw_buffer' / channel_dir
+            
+            logger.info(f"Scanning {raw_buffer_path}")
+            
+            if not raw_buffer_path.exists():
+                logger.warning(f"  No raw_buffer for {channel_name}")
+                continue
+            
+            minutes = []
+            # Scan all date directories
+            for date_dir in sorted(raw_buffer_path.iterdir()):
+                if not date_dir.is_dir():
+                    continue
+                # Find all .bin files
+                for bin_file in date_dir.glob("*.bin"):
+                    try:
+                        minute_ts = int(bin_file.stem)
+                        minutes.append(minute_ts // 60)  # Convert to minute number
+                    except ValueError:
+                        continue
+            
+            minutes = sorted(set(minutes))
+            all_minutes[channel_name] = minutes
+            logger.info(f"  Found {len(minutes)} minutes for {channel_name}")
+            if minutes:
+                logger.info(f"    Range: {minutes[0]} to {minutes[-1]}")
+        
+        if not all_minutes:
+            logger.error("No data found to reprocess")
+            return
+        
+        # Find common minutes (present in all channels) or process per-channel
+        # For now, process the most recent N minutes from each channel
+        processed_count = 0
+        
+        for channel_name, engine in engines_to_process.items():
+            if engine is None:
+                continue
+            
+            minutes = all_minutes.get(channel_name, [])
+            if not minutes:
+                continue
+            
+            # Take the most recent N minutes
+            minutes_to_process = minutes[-num_minutes:]
+            
+            logger.info(f"\nProcessing {channel_name}: {len(minutes_to_process)} minutes")
+            
+            for minute in minutes_to_process:
+                result = self._process_channel_minute(channel_name, engine, minute)
+                
+                if result:
+                    logger.info(
+                        f"  Minute {minute}: d_clock={result.d_clock_raw_ms:+.2f}ms, "
+                        f"station={result.station}, SNR={result.snr_db:.1f}dB"
+                        if result.snr_db else
+                        f"  Minute {minute}: d_clock={result.d_clock_raw_ms}ms, station={result.station}"
+                    )
+                    processed_count += 1
+                    
+                    # Write to SHM
+                    timing_result = TimingResult(
+                        timestamp=minute * 60,
+                        system_time=time.time(),
+                        d_clock_ms=result.d_clock_raw_ms or 0.0,
+                        d_clock_uncertainty_ms=result.uncertainty_ms,
+                        clock_status=ClockStatus.ACQUIRING,
+                        channels={channel_name: result},
+                        channels_active=1,
+                        channels_locked=1 if result.d_clock_raw_ms else 0,
+                        uptime_seconds=time.time() - self.start_time
+                    )
+                    self.shm_writer.write(timing_result)
+                else:
+                    logger.debug(f"  Minute {minute}: no result")
+        
+        logger.info("=" * 60)
+        logger.info(f"Reprocessing complete: {processed_count} results")
+        logger.info("=" * 60)
 
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
@@ -536,6 +675,21 @@ Examples:
         action='store_true',
         help='Enable debug logging'
     )
+    parser.add_argument(
+        '--reprocess',
+        action='store_true',
+        help='Reprocess historical data instead of polling for new data'
+    )
+    parser.add_argument(
+        '--minutes', '-n',
+        type=int,
+        default=10,
+        help='Number of minutes to process in reprocess mode (default: 10)'
+    )
+    parser.add_argument(
+        '--channel',
+        help='Process only this channel (e.g., "WWV 10 MHz")'
+    )
     
     args = parser.parse_args()
     
@@ -553,7 +707,14 @@ Examples:
     
     # Create and start daemon
     daemon = TimeManagerDaemon(config, data_root=args.data_root)
-    daemon.start()
+    
+    if args.reprocess:
+        daemon.reprocess(
+            num_minutes=args.minutes,
+            channel_filter=args.channel
+        )
+    else:
+        daemon.start()
 
 
 if __name__ == '__main__':

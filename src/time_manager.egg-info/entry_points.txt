@@ -1,0 +1,2 @@
+[console_scripts]
+time-manager = time_manager.main:main
