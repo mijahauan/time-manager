@@ -884,7 +884,7 @@ class LiveTimeEngine:
             try:
                 # Get or create tone detector for this channel
                 if name not in self._tone_detectors:
-                    from grape_recorder.grape.tone_detector import MultiStationToneDetector
+                    from ..timing import MultiStationToneDetector
                     # Use 20kHz sample rate (full rate, not decimated)
                     self._tone_detectors[name] = MultiStationToneDetector(name, self.sample_rate)
                 
@@ -1027,7 +1027,7 @@ class LiveTimeEngine:
             try:
                 # Get or create Phase2 engine for this channel
                 if name not in self._phase2_engines:
-                    from grape_recorder.grape.phase2_temporal_engine import Phase2TemporalEngine
+                    from ..timing import Phase2TemporalEngine
                     from pathlib import Path
                     
                     # Extract frequency from channel name

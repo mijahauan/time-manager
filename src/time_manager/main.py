@@ -191,14 +191,14 @@ class TimeManagerDaemon:
         """Initialize timing engines for each channel."""
         logger.info("Initializing channel engines...")
         
-        # For Phase A, we'll try to import from grape_recorder if available
+        # Import from local timing module
         # Later this will be refactored to use internal modules
         try:
             # Try to import the Phase 2 engine from grape-recorder
             # This allows us to test without duplicating code initially
             sys.path.insert(0, str(Path.home() / 'grape-recorder' / 'src'))
-            from grape_recorder.grape.phase2_temporal_engine import Phase2TemporalEngine
-            from grape_recorder.paths import channel_name_to_dir
+            from .timing import Phase2TemporalEngine
+            # paths not needed - time-manager is standalone
             
             for channel_name in self.channels:
                 channel_dir = channel_name_to_dir(channel_name)
@@ -230,7 +230,7 @@ class TimeManagerDaemon:
             logger.info(f"Initialized {len(self.channel_engines)} channel engines")
             
         except ImportError as e:
-            logger.error(f"Failed to import grape_recorder modules: {e}")
+            logger.error(f"Failed to import timing modules: {e}")
             logger.error("Using stub engines for testing")
             
             # Create stub engines for testing
@@ -302,7 +302,7 @@ class TimeManagerDaemon:
         """
         try:
             # Find the data file for this minute
-            from grape_recorder.paths import channel_name_to_dir
+            # paths not needed - time-manager is standalone
             
             channel_dir = channel_name_to_dir(channel_name)
             minute_ts = minute * 60
@@ -523,7 +523,7 @@ class TimeManagerDaemon:
             engines_to_process = self.channel_engines
         
         # Discover available minute files
-        from grape_recorder.paths import channel_name_to_dir
+        # paths not needed - time-manager is standalone
         
         all_minutes: Dict[str, List[int]] = {}
         

@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+"""
+WWV/WWVH Scientific Test Signal Generator and Detector
+
+Generates and detects the scientific modulation test signal transmitted at:
+- Minute 8 (WWV at Fort Collins, CO)
+- Minute 44 (WWVH at Kauai, HI)
+
+Signal designed by WWV/H Scientific Modulation Working Group.
+Reference: hamsci.org/wwv
+
+Signal structure (45 seconds total):
+1. Voice announcement (10s) - "What follows is a scientific modulation test..."
+2. Gaussian white noise (2s) - synchronization
+3. Blank time (1s)
+4. Phase-coherent multi-tone (10s) - 2, 3, 4, 5 kHz with 3dB attenuation steps
+5. Blank time (1s)
+6. Chirp sequences (8s) - linear up/down chirps, short and long
+7. Blank time (2s)
+8. Single-cycle bursts (2s) - 2.5 kHz and 5 kHz timing marks
+9. Blank time (1s)
+10. Gaussian white noise (2s) - repeated for synchronization
+11. Blank time (3s)
+
+This implementation focuses on the most distinctive features for discrimination:
+- Multi-tone with attenuation pattern (strongest discriminator)
+- Chirp sequences (confirmatory)
+- White noise bookends (for alignment)
+"""
+
+import numpy as np
+import logging
+from typing import Tuple, Optional, Dict
+from scipy import signal
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TestSignalDetection:
+    """
+    Results from test signal detection - Channel Sounding Instrument
+    
+    The test signal at minutes :08 (WWV) and :44 (WWVH) is IDENTICAL for both stations.
+    Discrimination comes from the SCHEDULE, not signal content. The value of detection
+    is channel characterization via multiple signal segments:
+    
+    Signal Structure (per Zenodo 5602094):
+    - 0-10s:  Voice announcement
+    - 10-12s: White noise #1 (wideband coherence)
+    - 12-13s: Blank
+    - 13-23s: Multi-tone 2,3,4,5 kHz (frequency selectivity)
+    - 23-24s: Blank
+    - 24-32s: Chirp sequences (delay spread via pulse compression)
+    - 32-34s: Blank
+    - 34-36s: Single-cycle bursts at 2.5kHz, 5kHz (high-precision timing)
+    - 36-37s: Blank
+    - 37-39s: White noise #2 (same as #1, for transient detection)
+    - 39-42s: Blank
+    """
+    detected: bool
+    confidence: float  # 0.0 to 1.0
+    station: Optional[str]  # 'WWV' or 'WWVH' (from schedule, not signal content)
+    minute_number: int
+    
+    # Feature-specific scores (for detection confidence)
+    multitone_score: float = 0.0
+    chirp_score: float = 0.0
+    noise_correlation: float = 0.0  # Average of noise1 and noise2
+    
+    # Timing information - high-precision ToA from template correlation
+    signal_start_time: Optional[float] = None  # Seconds into minute when signal detected
+    toa_offset_ms: Optional[float] = None  # Time of arrival offset from expected (ms)
+    burst_toa_offset_ms: Optional[float] = None  # High-precision ToA from single-cycle bursts
+    
+    # SNR measurement - high processing gain from complex signal structure
+    snr_db: Optional[float] = None
+    
+    # Channel characterization from test signal analysis
+    delay_spread_ms: Optional[float] = None  # Multipath delay spread (from chirp analysis)
+    coherence_time_sec: Optional[float] = None  # Channel coherence time estimate
+    
+    # Frequency Selectivity Score (FSS) - path signature
+    # FSS = 10*log10((P_2kHz + P_3kHz) / (P_4kHz + P_5kHz))
+    # Positive FSS = high-frequency attenuation (longer/more dispersive path)
+    frequency_selectivity_db: Optional[float] = None
+    tone_powers_db: Optional[Dict[int, float]] = None  # Individual tone powers {2000: dB, 3000: dB, ...}
+    
+    # Noise segment analysis for transient interference detection
+    noise1_score: float = 0.0  # Noise segment at 10-12s
+    noise2_score: float = 0.0  # Noise segment at 37-39s
+    noise_coherence_diff: Optional[float] = None  # |noise1 - noise2|, high = transient event
+
+
+class WWVTestSignalGenerator:
+    """
+    Generate WWV/WWVH scientific test signal
+    
+    This is a deterministic signal that can be generated at any sample rate
+    for template matching and discrimination purposes.
+    """
+    
+    def __init__(self, sample_rate: int = 20000):
+        """
+        Initialize test signal generator
+        
+        Args:
+            sample_rate: Sample rate in Hz (20000 default, 16000 for legacy)
+        """
+        self.sample_rate = sample_rate
+        self.dt = 1.0 / sample_rate
+        
+    def generate_white_noise(self, duration_sec: float, seed: Optional[int] = None) -> np.ndarray:
+        """
+        Generate Gaussian white noise segment
+        
+        Args:
+            duration_sec: Duration in seconds
+            seed: Random seed for reproducibility (optional)
+            
+        Returns:
+            Normalized white noise array
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        
+        num_samples = int(duration_sec * self.sample_rate)
+        noise = np.random.randn(num_samples)
+        
+        # Normalize to prevent clipping
+        noise = noise / np.max(np.abs(noise))
+        
+        return noise
+    
+    def generate_multitone(self, duration_sec: float = 10.0) -> np.ndarray:
+        """
+        Generate phase-coherent multi-tone sequence with 3dB attenuation steps
+        
+        This is the most distinctive feature of the test signal:
+        - Four tones: 2, 3, 4, 5 kHz
+        - All phase-locked (coherent)
+        - 1 second at each attenuation level
+        - Starts at -12 dB (0.25 amplitude), attenuates by 3 dB 9 times
+        
+        Args:
+            duration_sec: Total duration (default 10s for 10 attenuation steps)
+            
+        Returns:
+            Multi-tone signal array
+        """
+        t = np.arange(0, 1.0, self.dt)  # 1 second segments
+        
+        # Generate four phase-locked tones
+        tone_2k = np.cos(2 * np.pi * 2000 * t)
+        tone_3k = np.cos(2 * np.pi * 3000 * t)
+        tone_4k = np.cos(2 * np.pi * 4000 * t)
+        tone_5k = np.cos(2 * np.pi * 5000 * t)
+        
+        # Sum and scale to prevent clipping
+        tone_sum = tone_2k + tone_3k + tone_4k + tone_5k
+        tone_1sec = 0.25 * tone_sum  # Start at -12 dB
+        
+        # Create attenuation sequence: 10 steps of 3 dB
+        multitone = tone_1sec.copy()
+        current_level = tone_1sec
+        
+        for i in range(9):  # 9 more attenuation steps
+            current_level = current_level / np.sqrt(2)  # -3 dB
+            multitone = np.concatenate([multitone, current_level])
+        
+        return multitone
+    
+    def generate_chirp_sequence(self) -> np.ndarray:
+        """
+        Generate chirp sequence: short and long up/down chirps
+        
+        Sequence:
+        - 3 short up-chirps (0.05s each, 0-5 kHz, TBW=250)
+        - 3 short down-chirps
+        - 0.5s blank
+        - 3 long up-chirps (1.0s each, 0-5 kHz, TBW=5000)
+        - 3 long down-chirps
+        - 0.1s gaps between chirps
+        
+        Total: ~8 seconds
+        
+        Returns:
+            Chirp sequence array
+        """
+        short_duration = 0.05
+        long_duration = 1.0
+        gap_duration = 0.1
+        
+        # Short chirps
+        t_short = np.arange(0, short_duration, self.dt)
+        short_up = signal.chirp(t_short, 0, short_duration, 5000, method='linear')
+        short_down = signal.chirp(t_short, 5000, short_duration, 0, method='linear')
+        
+        # Long chirps
+        t_long = np.arange(0, long_duration, self.dt)
+        long_up = signal.chirp(t_long, 0, long_duration, 5000, method='linear')
+        long_down = signal.chirp(t_long, 5000, long_duration, 0, method='linear')
+        
+        # Gaps
+        gap = np.zeros(int(gap_duration * self.sample_rate))
+        long_gap = np.zeros(int(0.5 * self.sample_rate))
+        
+        # Assemble sequence
+        chirp_seq = np.concatenate([
+            # 3 short up
+            short_up, gap, short_up, gap, short_up, gap,
+            # 3 short down
+            short_down, gap, short_down, gap, short_down,
+            # 0.5s gap
+            long_gap,
+            # 3 long up
+            long_up, gap, long_up, gap, long_up, gap,
+            # 3 long down
+            long_down, gap, long_down, gap, long_down, gap
+        ])
+        
+        return chirp_seq
+    
+    def generate_burst_sequence(self) -> np.ndarray:
+        """
+        Generate single-cycle burst sequence for timing measurement
+        
+        - 5 bursts of 2.5 kHz (one cycle each)
+        - 5 bursts of 5 kHz (one cycle each)
+        - Evenly spaced over 1 second each
+        
+        Total: 2 seconds
+        
+        Returns:
+            Burst sequence array
+        """
+        # 2.5 kHz bursts
+        t_2k5 = np.arange(0, 1.0/2500, self.dt)
+        burst_2k5 = np.sin(2 * np.pi * 2500 * t_2k5)
+        
+        # 5 kHz bursts
+        t_5k = np.arange(0, 1.0/5000, self.dt)
+        burst_5k = np.sin(2 * np.pi * 5000 * t_5k)
+        
+        # Create 1-second sequences with 5 bursts each
+        burst_interval = int(self.sample_rate / 6)  # ~6 bursts per second
+        
+        seq_2k5 = np.zeros(self.sample_rate)
+        seq_5k = np.zeros(self.sample_rate)
+        
+        for i in range(5):
+            start_idx = i * burst_interval
+            seq_2k5[start_idx:start_idx + len(burst_2k5)] = burst_2k5
+            seq_5k[start_idx:start_idx + len(burst_5k)] = burst_5k
+        
+        return np.concatenate([seq_2k5, seq_5k])
+    
+    def generate_full_signal(self, include_voice: bool = False) -> np.ndarray:
+        """
+        Generate complete test signal
+        
+        Args:
+            include_voice: If True, prepend 10s silence placeholder for voice
+                          (actual voice is pre-recorded, not synthesized)
+            
+        Returns:
+            Complete test signal array
+        """
+        components = []
+        
+        # Voice announcement (10s) - placeholder
+        if include_voice:
+            components.append(np.zeros(int(10 * self.sample_rate)))
+        
+        # 1. White noise (2s) - fixed seed for template matching
+        components.append(self.generate_white_noise(2.0, seed=42))
+        
+        # 2. Blank (1s)
+        components.append(np.zeros(int(1 * self.sample_rate)))
+        
+        # 3. Multi-tone with attenuation (10s) - STRONGEST DISCRIMINATOR
+        components.append(self.generate_multitone(10.0))
+        
+        # 4. Blank (1s)
+        components.append(np.zeros(int(1 * self.sample_rate)))
+        
+        # 5. Chirp sequences (8s)
+        components.append(self.generate_chirp_sequence())
+        
+        # 6. Blank (2s)
+        components.append(np.zeros(int(2 * self.sample_rate)))
+        
+        # 7. Single-cycle bursts (2s)
+        components.append(self.generate_burst_sequence())
+        
+        # 8. Blank (1s)
+        components.append(np.zeros(int(1 * self.sample_rate)))
+        
+        # 9. White noise (2s) - same seed for synchronization
+        components.append(self.generate_white_noise(2.0, seed=42))
+        
+        # 10. Blank (3s)
+        components.append(np.zeros(int(3 * self.sample_rate)))
+        
+        full_signal = np.concatenate(components)
+        
+        logger.info(f"Generated test signal: {len(full_signal)/self.sample_rate:.1f} seconds")
+        
+        return full_signal
+    
+    def get_multitone_template(self) -> np.ndarray:
+        """
+        Get just the multi-tone segment for template matching
+        
+        This is the most distinctive feature for discrimination.
+        
+        Returns:
+            10-second multi-tone template
+        """
+        return self.generate_multitone(10.0)
+    
+    def get_chirp_template(self) -> np.ndarray:
+        """
+        Get just the chirp sequence for template matching
+        
+        Returns:
+            ~8-second chirp template
+        """
+        return self.generate_chirp_sequence()
+
+
+class WWVTestSignalDetector:
+    """
+    Detect WWV/WWVH scientific test signal in received audio
+    
+    Detection strategy:
+    1. Check minute number (must be 8 for WWV or 44 for WWVH)
+    2. White noise matched filter for high-precision ToA (BT≈10000, 40dB gain)
+    3. Cross-correlate against multi-tone template for detection
+    4. Chirp matched filter for delay spread estimation
+    5. Multi-tone fading analysis for coherence time
+    6. Classify as WWV or WWVH based on minute number
+    
+    Signal timing (seconds into minute):
+        0-10:  Voice announcement
+        10-12: White noise #1 (deterministic, seed=42)
+        12-13: Blank
+        13-23: Multi-tone with 3dB attenuation steps
+        23-24: Blank
+        24-32: Chirp sequences
+        32-34: Blank
+        34-36: Single-cycle bursts
+        36-37: Blank
+        37-39: White noise #2 (identical to #1)
+        39-42: Blank
+    """
+    
+    # Signal timing constants (seconds into minute, per Zenodo 5602094)
+    NOISE1_START = 10.0
+    NOISE1_END = 12.0
+    MULTITONE_START = 13.0
+    MULTITONE_END = 23.0
+    CHIRP_START = 24.0
+    CHIRP_END = 32.0
+    BURST_START = 34.0  # Single-cycle bursts: 5x @ 2.5kHz then 5x @ 5kHz
+    BURST_END = 36.0
+    NOISE2_START = 37.0
+    NOISE2_END = 39.0
+    
+    # Tone frequencies for multi-tone segment
+    TONE_FREQUENCIES = [2000, 3000, 4000, 5000]  # Hz
+    
+    def __init__(self, sample_rate: int = 20000):
+        """
+        Initialize detector
+        
+        Args:
+            sample_rate: Sample rate in Hz
+        """
+        self.sample_rate = sample_rate
+        self.generator = WWVTestSignalGenerator(sample_rate)
+        
+        # Pre-generate templates for matched filtering
+        self.multitone_template = self.generator.get_multitone_template()
+        self.chirp_template = self.generator.get_chirp_template()
+        
+        # White noise template - NOTE: This is for energy detection only!
+        # The actual WWV broadcast uses a specific PRNG sequence (LabVIEW implementation)
+        # that differs from Python's random generator. Cross-correlation requires
+        # bit-identical sequences, so matched filtering won't provide processing gain.
+        # See: https://github.com/aidanmontare-edu/wwv-h-characterization-signal-ports
+        # We keep this for energy-based detection as a secondary indicator.
+        self.noise_template = self.generator.generate_white_noise(2.0, seed=42)
+        
+        # Generate chirp templates per official WWV spec (Zenodo 5602094):
+        # - Long chirp: 5 kHz over 1 second (TBW = 5000)
+        # - Short chirp: 5 kHz over 0.05 seconds (TBW = 250)
+        # Sequence: 3 short up, 3 short down, 0.5s blank, 3 long up, 3 long down
+        # 100 ms between chirps
+        
+        # Long chirp (1 second, 0-5 kHz)
+        t_long = np.arange(0, 1.0, 1.0/sample_rate)
+        self.long_chirp_up = signal.chirp(t_long, 0, 1.0, 5000, method='linear')
+        self.long_chirp_down = signal.chirp(t_long, 5000, 1.0, 0, method='linear')
+        
+        # Short chirp (50 ms, 0-5 kHz) - higher time-bandwidth product density
+        t_short = np.arange(0, 0.05, 1.0/sample_rate)
+        self.short_chirp_up = signal.chirp(t_short, 0, 0.05, 5000, method='linear')
+        self.short_chirp_down = signal.chirp(t_short, 5000, 0.05, 0, method='linear')
+        
+        # Detection thresholds
+        self.multitone_threshold = 0.15
+        self.chirp_threshold = 0.15  # Lowered - chirps are harder to detect through ionosphere
+        self.noise_threshold = 0.3
+        self.combined_threshold = 0.20
+        
+        logger.info(f"Test signal detector initialized (sample_rate={sample_rate})")
+        logger.info(f"  White noise template: {len(self.noise_template)} samples")
+        logger.info(f"  Chirp templates: long={len(self.long_chirp_up)}, short={len(self.short_chirp_up)} samples")
+    
+    def detect(
+        self,
+        iq_samples: np.ndarray,
+        minute_number: int,
+        sample_rate: int
+    ) -> TestSignalDetection:
+        """
+        Detect test signal in received IQ samples with full signal exploitation
+        
+        Args:
+            iq_samples: Complex IQ samples (full minute, ~1200000 samples @ 20kHz)
+            minute_number: Minute of hour (0-59)
+            sample_rate: Sample rate in Hz
+            
+        Returns:
+            TestSignalDetection object with comprehensive results including:
+            - High-precision ToA from white noise matched filter
+            - Delay spread from chirp impulse response
+            - Coherence time from multi-tone fading analysis
+            - Processing-gain SNR estimate
+        """
+        # Quick exit if not test signal minute
+        if minute_number not in [8, 44]:
+            return TestSignalDetection(
+                detected=False,
+                confidence=0.0,
+                station=None,
+                minute_number=minute_number
+            )
+        
+        # Determine expected station from schedule
+        expected_station = 'WWV' if minute_number == 8 else 'WWVH'
+        
+        # Convert IQ to demodulated audio using AM envelope detection
+        if np.iscomplexobj(iq_samples):
+            envelope = np.abs(iq_samples)
+            audio_signal = envelope - np.mean(envelope)
+        else:
+            audio_signal = iq_samples
+        
+        # Resample if necessary
+        if sample_rate != self.sample_rate:
+            num_samples = int(len(audio_signal) * self.sample_rate / sample_rate)
+            audio_signal = signal.resample(audio_signal, num_samples)
+        
+        # Normalize
+        max_val = np.max(np.abs(audio_signal))
+        if max_val > 0:
+            audio_signal = audio_signal / max_val
+        
+        # === STAGE 1: Detection (is test signal present?) ===
+        
+        # Multi-tone detection (most robust for presence detection)
+        multitone_score_template, multitone_start = self._detect_multitone(audio_signal)
+        multitone_score_simple = self._detect_multitone_simple(audio_signal)
+        multitone_score = max(multitone_score_template, multitone_score_simple)
+        
+        # If simple method wins but template method gave no start time,
+        # use expected segment start as coarse estimate
+        if multitone_score_simple > multitone_score_template and multitone_start is None:
+            if multitone_score_simple > self.multitone_threshold:
+                multitone_start = self.MULTITONE_START  # Coarse: signal present at expected time
+        
+        # White noise analysis (both segments for transient detection)
+        noise1_score, noise2_score, noise_coherence_diff = self._detect_both_noise_segments(audio_signal)
+        noise_score = (noise1_score + noise2_score) / 2.0  # Average for overall detection
+        
+        # Chirp matched filter detection
+        chirp_score, chirp_toa_sec, delay_spread_ms = self._detect_chirp_matched(audio_signal)
+        
+        # Single-cycle burst detection (highest precision timing)
+        burst_score, burst_toa_offset_ms = self._detect_single_cycle_bursts(audio_signal)
+        
+        # Combined confidence: multi-tone is most reliable, noise confirms timing
+        confidence = 0.5 * multitone_score + 0.3 * noise_score + 0.2 * chirp_score
+        detected = confidence >= self.combined_threshold
+        
+        # === STAGE 2: Timing (high-precision ToA) ===
+        
+        # Priority: burst (highest resolution) → chirp (high BT) → multitone → noise
+        # Burst: Single-cycle pulses have sharpest time-domain resolution (τ ≈ 1/f)
+        # Chirp: Pulse compression provides sub-ms precision via BT product (~5000)
+        # Multitone: Onset detection provides coarse timing
+        toa_offset_ms = None
+        toa_source = None
+        
+        if burst_score > 0.3 and burst_toa_offset_ms is not None:
+            # Burst has highest time resolution (lowest uncertainty)
+            toa_offset_ms = burst_toa_offset_ms
+            toa_source = 'burst'
+        elif chirp_toa_sec is not None and chirp_score > self.chirp_threshold:
+            # Chirp has high processing gain, excellent secondary timing source
+            toa_offset_ms = (chirp_toa_sec - self.CHIRP_START) * 1000.0
+            toa_source = 'chirp'
+        elif multitone_start is not None and multitone_score > self.multitone_threshold:
+            # Multi-tone provides robust coarse time alignment
+            toa_offset_ms = (multitone_start - self.MULTITONE_START) * 1000.0
+            toa_source = 'multitone'
+        elif noise1_score > self.noise_threshold:
+            # Noise segment energy onset (coarse timing)
+            toa_offset_ms = 0.0
+            toa_source = 'noise'
+        
+        # === STAGE 3: Channel Characterization ===
+        
+        # Frequency Selectivity Score (FSS) - path signature
+        fss_db, tone_powers = self._calculate_frequency_selectivity(audio_signal)
+        
+        # Coherence time from multi-tone fading pattern
+        coherence_time_sec = None
+        if detected:
+            coherence_time_sec = self._estimate_coherence_time(audio_signal)
+        
+        # Delay spread already computed from chirp matched filter
+        
+        # SNR estimate with processing gain consideration
+        snr_db = None
+        if detected:
+            snr_db = self._estimate_snr_with_gain(audio_signal, noise_score, chirp_score)
+        
+        # === STAGE 4: Logging ===
+        
+        logger.info(f"Test signal detection: minute={minute_number} ({expected_station})")
+        logger.info(f"  Scores: multitone={multitone_score:.3f}, noise={noise_score:.3f}, "
+                   f"chirp={chirp_score:.3f}, burst={burst_score:.3f}")
+        logger.info(f"  Confidence: {confidence:.3f}, detected={detected}")
+        if toa_offset_ms is not None:
+            logger.info(f"  ToA: {toa_offset_ms:+.2f}ms (from {toa_source})")
+        if fss_db is not None:
+            logger.info(f"  Frequency selectivity (FSS): {fss_db:.1f}dB")
+        if delay_spread_ms is not None:
+            logger.info(f"  Delay spread: {delay_spread_ms:.2f}ms")
+        if coherence_time_sec is not None:
+            logger.info(f"  Coherence time: {coherence_time_sec:.2f}s")
+        if noise_coherence_diff is not None and noise_coherence_diff > 0.1:
+            logger.warning(f"  ⚠️ Noise segment diff: {noise_coherence_diff:.2f} (possible transient event)")
+        
+        return TestSignalDetection(
+            detected=detected,
+            confidence=confidence,
+            station=expected_station if detected else None,
+            minute_number=minute_number,
+            multitone_score=multitone_score,
+            chirp_score=chirp_score,
+            noise_correlation=noise_score,
+            signal_start_time=multitone_start,
+            toa_offset_ms=toa_offset_ms,
+            burst_toa_offset_ms=burst_toa_offset_ms,
+            snr_db=snr_db,
+            delay_spread_ms=delay_spread_ms,
+            coherence_time_sec=coherence_time_sec,
+            frequency_selectivity_db=fss_db,
+            tone_powers_db=tone_powers if tone_powers else None,
+            noise1_score=noise1_score,
+            noise2_score=noise2_score,
+            noise_coherence_diff=noise_coherence_diff
+        )
+    
+    def _detect_multitone(self, audio_signal: np.ndarray) -> Tuple[float, Optional[float]]:
+        """
+        Detect multi-tone sequence using normalized cross-correlation
+        
+        Uses a sliding window approach with proper normalization to compute
+        correlation coefficient at each position.
+        
+        Returns:
+            (correlation_score, start_time_sec)
+        """
+        template = self.multitone_template
+        template_len = len(template)
+        
+        # Pre-compute template statistics
+        template_mean = np.mean(template)
+        template_std = np.std(template)
+        template_energy = np.sum((template - template_mean)**2)
+        
+        if template_std < 1e-10 or template_energy < 1e-10:
+            return 0.0, None
+        
+        # Compute local means and stds using convolution (efficient)
+        ones = np.ones(template_len)
+        signal_len = len(audio_signal)
+        
+        # Local sums
+        local_sum = signal.correlate(audio_signal, ones, mode='valid')
+        local_mean = local_sum / template_len
+        
+        # Local squared sums for std calculation
+        local_sum_sq = signal.correlate(audio_signal**2, ones, mode='valid')
+        local_var = (local_sum_sq / template_len) - local_mean**2
+        local_var = np.maximum(local_var, 0.0)  # Avoid negative variance from numerical errors
+        local_std = np.sqrt(local_var)
+        
+        # Cross-correlation
+        template_centered = template - template_mean
+        correlation = signal.correlate(audio_signal, template_centered, mode='valid')
+        
+        # Normalize: corr_coef = correlation / (template_std * local_std * template_len)
+        # But template is already centered, so we use template_energy instead
+        normalized_corr = np.zeros(len(correlation))
+        for i in range(len(correlation)):
+            if local_std[i] > 1e-10:
+                # Pearson correlation coefficient
+                local_energy = local_std[i]**2 * template_len
+                normalized_corr[i] = correlation[i] / np.sqrt(template_energy * local_energy)
+        
+        # Find peak correlation
+        peak_idx = np.argmax(np.abs(normalized_corr))
+        score = np.clip(abs(normalized_corr[peak_idx]), 0.0, 1.0)
+        
+        start_time = peak_idx / self.sample_rate if score > self.multitone_threshold else None
+        
+        return score, start_time
+    
+    def _detect_multitone_simple(self, audio_signal: np.ndarray) -> float:
+        """
+        Simple multi-tone detection based on presence of 2, 3, 4, 5 kHz tones
+        
+        This method is more robust to ionospheric fading and phase distortion
+        than template correlation. It counts 1-second windows in the expected
+        test signal period (13-23 seconds) where at least 3 of 4 tones have
+        positive SNR (5 kHz is often attenuated near the Nyquist limit).
+        
+        Returns:
+            Detection score 0.0 to 1.0 (fraction of windows with sufficient tones)
+        """
+        from scipy.fft import rfft, rfftfreq
+        
+        # Expected multi-tone window: 13-23 seconds into minute
+        multitone_start_sec = 13
+        multitone_end_sec = 23
+        
+        # Analyze 1-second windows
+        windows_passing = 0
+        total_windows = 0
+        
+        for sec in range(multitone_start_sec, multitone_end_sec):
+            start = sec * self.sample_rate
+            end = start + self.sample_rate
+            
+            if end > len(audio_signal):
+                break
+            
+            segment = audio_signal[start:end]
+            
+            # FFT
+            fft_result = np.abs(rfft(segment))
+            freqs = rfftfreq(len(segment), 1/self.sample_rate)
+            
+            # Measure power at each test signal frequency
+            tone_snrs = []
+            for target in [2000, 3000, 4000, 5000]:
+                idx = np.argmin(np.abs(freqs - target))
+                tone_power = np.max(fft_result[max(0, idx-1):idx+2])
+                
+                # Noise reference at 1.5 kHz (clean band)
+                noise_idx = np.argmin(np.abs(freqs - 1500))
+                noise_level = np.mean(fft_result[max(0, noise_idx-10):noise_idx+10])
+                
+                if noise_level > 0:
+                    snr_db = 20 * np.log10(tone_power / noise_level)
+                else:
+                    snr_db = 0
+                    
+                tone_snrs.append(snr_db)
+            
+            # Count tones with positive SNR
+            # Note: 5 kHz (tone_snrs[3]) is often attenuated near Nyquist limit
+            tones_detected = sum(1 for snr in tone_snrs if snr > 0)
+            
+            # Require at least 3 of 4 tones (2, 3, 4 kHz are most reliable)
+            # Give extra credit if all 4 are present
+            if tones_detected >= 3:
+                windows_passing += 1
+            
+            total_windows += 1
+        
+        if total_windows == 0:
+            return 0.0
+        
+        # Score is fraction of windows with sufficient tones present
+        raw_score = windows_passing / total_windows
+        
+        # Scale to match detection range
+        # 30% of windows = 0.20 (threshold), 80% = 1.0
+        if raw_score < 0.2:
+            score = raw_score * 0.75  # Below threshold but give some credit
+        else:
+            score = min(1.0, 0.20 + (raw_score - 0.2) * 1.33)
+        
+        logger.debug(f"Simple multitone: {windows_passing}/{total_windows} windows "
+                    f"({raw_score:.1%}), score={score:.3f}")
+        
+        return score
+    
+    def _detect_chirp(self, audio_signal: np.ndarray) -> Tuple[float, Optional[float]]:
+        """
+        Detect chirp sequence using spectrogram analysis
+        
+        Returns:
+            (detection_score, start_time_sec)
+        """
+        # For chirps, use spectrogram rather than simple correlation
+        # Look for characteristic time-frequency signature
+        
+        # Compute spectrogram
+        f, t, Sxx = signal.spectrogram(
+            audio_signal,
+            fs=self.sample_rate,
+            nperseg=512,
+            noverlap=256
+        )
+        
+        # Look for energy in 0-5 kHz band (chirp range)
+        chirp_band = (f >= 0) & (f <= 5000)
+        chirp_energy = np.sum(Sxx[chirp_band, :], axis=0)
+        
+        # Chirps create distinctive peaks in energy
+        # Simple heuristic: look for variance in chirp band
+        if len(chirp_energy) > 0:
+            chirp_variance = np.std(chirp_energy) / (np.mean(chirp_energy) + 1e-10)
+            score = np.clip(chirp_variance / 10.0, 0.0, 1.0)  # Empirical scaling
+        else:
+            score = 0.0
+        
+        # Rough start time from energy peak
+        if score > self.chirp_threshold:
+            peak_time_idx = np.argmax(chirp_energy)
+            start_time = t[peak_time_idx]
+        else:
+            start_time = None
+        
+        return score, start_time
+    
+    def _estimate_snr(
+        self,
+        audio_signal: np.ndarray,
+        signal_start: float,
+        signal_length: int
+    ) -> float:
+        """
+        Estimate SNR of detected signal
+        
+        Args:
+            audio_signal: Full audio signal
+            signal_start: Start time of signal (seconds)
+            signal_length: Length of signal (samples)
+            
+        Returns:
+            SNR in dB
+        """
+        start_idx = int(signal_start * self.sample_rate)
+        end_idx = start_idx + signal_length
+        
+        if end_idx > len(audio_signal):
+            return 0.0
+        
+        # Signal power
+        signal_segment = audio_signal[start_idx:end_idx]
+        signal_power = np.mean(signal_segment**2)
+        
+        # Noise power (from before signal)
+        noise_start = max(0, start_idx - signal_length)
+        noise_segment = audio_signal[noise_start:start_idx]
+        noise_power = np.mean(noise_segment**2) if len(noise_segment) > 0 else 1e-10
+        
+        snr_db = 10 * np.log10(signal_power / noise_power)
+        
+        return float(snr_db)
+    
+    def _detect_white_noise(self, audio_signal: np.ndarray) -> Tuple[float, Optional[float]]:
+        """
+        Detect white noise segments using energy and spectral flatness
+        
+        The test signal has white noise at:
+        - 10-12 seconds (noise #1)
+        - 37-39 seconds (noise #2, identical)
+        
+        NOTE: Matched filtering is NOT possible because the actual WWV broadcast
+        uses a LabVIEW PRNG sequence that differs from Python's implementation.
+        Instead, we detect noise by:
+        1. High energy in the expected time window
+        2. Spectral flatness (white noise has flat spectrum)
+        
+        Returns:
+            (detection_score, toa_seconds) - ToA is start of noise segment
+        """
+        from scipy.fft import rfft, rfftfreq
+        
+        # Extract expected noise region (10-12s)
+        noise_start = int(self.NOISE1_START * self.sample_rate)
+        noise_end = int(self.NOISE1_END * self.sample_rate)
+        
+        if noise_end > len(audio_signal):
+            return 0.0, None
+        
+        noise_segment = audio_signal[noise_start:noise_end]
+        
+        # Compare to adjacent segments for relative energy
+        pre_start = int((self.NOISE1_START - 2.0) * self.sample_rate)
+        pre_segment = audio_signal[max(0, pre_start):noise_start]
+        
+        noise_power = np.mean(noise_segment**2)
+        pre_power = np.mean(pre_segment**2) if len(pre_segment) > 0 else 1e-10
+        
+        # Energy ratio (noise should be louder than voice gap before it)
+        energy_ratio = noise_power / (pre_power + 1e-10)
+        
+        # Spectral flatness: ratio of geometric to arithmetic mean of spectrum
+        # White noise ≈ 1.0, tonal signals << 1.0
+        fft_result = np.abs(rfft(noise_segment[:self.sample_rate]))  # First second
+        fft_power = fft_result[10:] ** 2  # Skip DC and very low frequencies
+        
+        if len(fft_power) > 0 and np.all(fft_power > 0):
+            geometric_mean = np.exp(np.mean(np.log(fft_power + 1e-10)))
+            arithmetic_mean = np.mean(fft_power)
+            spectral_flatness = geometric_mean / (arithmetic_mean + 1e-10)
+        else:
+            spectral_flatness = 0.0
+        
+        # Combined score: both energy and flatness should be high
+        # Scale energy_ratio (typically 1-10) and flatness (0-1) to 0-1 range
+        energy_score = np.clip((energy_ratio - 1.0) / 5.0, 0.0, 1.0)
+        flatness_score = np.clip(spectral_flatness * 2.0, 0.0, 1.0)
+        
+        score = 0.5 * energy_score + 0.5 * flatness_score
+        
+        # ToA is simply the expected start time (no matched filter precision)
+        toa_sec = self.NOISE1_START if score > 0.2 else None
+        
+        logger.debug(f"White noise energy detection: energy_ratio={energy_ratio:.2f}, "
+                    f"flatness={spectral_flatness:.3f}, score={score:.3f}")
+        
+        return score, toa_sec
+    
+    def _detect_chirp_matched(self, audio_signal: np.ndarray) -> Tuple[float, Optional[float], Optional[float]]:
+        """
+        Detect chirp sequences using matched filter for ToA and delay spread
+        
+        Official WWV chirp structure (8 seconds at 24-32s into minute):
+        - 3 short up-chirps (50ms each, 100ms spacing)
+        - 3 short down-chirps (50ms each, 100ms spacing)
+        - 0.5s blank
+        - 3 long up-chirps (1s each, 100ms spacing)
+        - 3 long down-chirps (1s each, 100ms spacing)
+        
+        Short chirps: 5 kHz over 50ms (TBW=250)
+        Long chirps: 5 kHz over 1s (TBW=5000)
+        
+        Returns:
+            (score, toa_seconds, delay_spread_ms)
+        """
+        # Search window around expected chirp location (24-32s)
+        search_start = int((self.CHIRP_START - 0.5) * self.sample_rate)
+        search_end = int((self.CHIRP_END + 0.5) * self.sample_rate)
+        
+        if search_end > len(audio_signal):
+            search_end = len(audio_signal)
+        if search_start < 0:
+            search_start = 0
+        
+        search_segment = audio_signal[search_start:search_end]
+        
+        if len(search_segment) < len(self.long_chirp_up):
+            return 0.0, None, None
+        
+        # Matched filter with SHORT chirp templates (50ms)
+        # These come first in the sequence and are easier to detect
+        short_corr_up = signal.correlate(search_segment, self.short_chirp_up, mode='valid')
+        short_corr_down = signal.correlate(search_segment, self.short_chirp_down, mode='valid')
+        
+        # Matched filter with LONG chirp templates (1s)
+        long_corr_up = signal.correlate(search_segment, self.long_chirp_up, mode='valid')
+        long_corr_down = signal.correlate(search_segment, self.long_chirp_down, mode='valid')
+        
+        # Normalize correlations
+        short_energy = np.sum(self.short_chirp_up**2)
+        long_energy = np.sum(self.long_chirp_up**2)
+        
+        # Peak detection for each type
+        short_max = max(np.max(np.abs(short_corr_up)), np.max(np.abs(short_corr_down)))
+        long_max = max(np.max(np.abs(long_corr_up)), np.max(np.abs(long_corr_down)))
+        
+        short_score = np.clip(short_max / (short_energy + 1e-10), 0.0, 1.0)
+        long_score = np.clip(long_max / (long_energy + 1e-10), 0.0, 1.0)
+        
+        # Combined score - weight long chirps higher (more processing gain)
+        score = 0.3 * short_score + 0.7 * long_score
+        
+        # Find ToA from long chirp correlation peak (better precision)
+        combined_long = np.abs(long_corr_up) + np.abs(long_corr_down)
+        peak_idx = np.argmax(combined_long)
+        toa_samples = search_start + peak_idx
+        toa_sec = toa_samples / self.sample_rate
+        
+        # Estimate delay spread from long chirp matched filter response width
+        # The -3dB width reveals multipath spreading
+        delay_spread_ms = None
+        if long_score > 0.05:
+            peak_val = combined_long[peak_idx]
+            half_power = peak_val * 0.707
+            
+            # Find -3dB points
+            left_idx = peak_idx
+            while left_idx > 0 and combined_long[left_idx] > half_power:
+                left_idx -= 1
+            
+            right_idx = peak_idx
+            while right_idx < len(combined_long) - 1 and combined_long[right_idx] > half_power:
+                right_idx += 1
+            
+            # Width in samples, convert to ms
+            width_samples = right_idx - left_idx
+            delay_spread_ms = (width_samples / self.sample_rate) * 1000.0
+            
+            # Subtract ideal width (1s chirp with 5kHz BW → ~0.2ms resolution)
+            ideal_width_ms = 0.2
+            delay_spread_ms = max(0.0, delay_spread_ms - ideal_width_ms)
+        
+        logger.debug(f"Chirp detection: short={short_score:.3f}, long={long_score:.3f}, "
+                    f"combined={score:.3f}")
+        
+        logger.debug(f"Chirp matched filter: score={score:.3f}, ToA={toa_sec:.3f}s, "
+                    f"delay_spread={delay_spread_ms:.2f}ms" if delay_spread_ms else "")
+        
+        return score, toa_sec if score > 0.1 else None, delay_spread_ms
+    
+    def _estimate_coherence_time(self, audio_signal: np.ndarray) -> Optional[float]:
+        """
+        Estimate channel coherence time from multi-tone fading pattern
+        
+        The 10-second multi-tone segment (13-23s) has 1-second windows with
+        known attenuation steps. Deviations from expected pattern reveal fading.
+        Coherence time is estimated from the fading rate.
+        
+        Returns:
+            Coherence time in seconds (None if cannot estimate)
+        """
+        from scipy.fft import rfft, rfftfreq
+        
+        # Extract multi-tone segment
+        start_idx = int(self.MULTITONE_START * self.sample_rate)
+        end_idx = int(self.MULTITONE_END * self.sample_rate)
+        
+        if end_idx > len(audio_signal):
+            return None
+        
+        multitone_segment = audio_signal[start_idx:end_idx]
+        
+        # Measure power in each 1-second window at 2 kHz (most reliable tone)
+        tone_powers = []
+        for sec in range(10):
+            window_start = sec * self.sample_rate
+            window_end = window_start + self.sample_rate
+            
+            if window_end > len(multitone_segment):
+                break
+            
+            window = multitone_segment[window_start:window_end]
+            
+            # FFT to get power at 2 kHz
+            fft_result = np.abs(rfft(window))
+            freqs = rfftfreq(len(window), 1/self.sample_rate)
+            
+            idx_2k = np.argmin(np.abs(freqs - 2000))
+            power_2k = np.max(fft_result[max(0, idx_2k-2):idx_2k+3])
+            tone_powers.append(power_2k)
+        
+        if len(tone_powers) < 5:
+            return None
+        
+        tone_powers = np.array(tone_powers)
+        
+        # Expected pattern: 3dB attenuation per second (factor of √2)
+        # Normalize by expected attenuation to isolate fading
+        expected_atten = np.array([1.0 / (2**(i/2)) for i in range(len(tone_powers))])
+        
+        # Detrend by expected pattern
+        with np.errstate(divide='ignore', invalid='ignore'):
+            normalized = tone_powers / (expected_atten * tone_powers[0] + 1e-10)
+            normalized = np.nan_to_num(normalized, nan=1.0)
+        
+        # Estimate coherence time from autocorrelation of fading
+        # Fast fading → short coherence time
+        if len(normalized) > 2:
+            # Compute variance of normalized power fluctuations
+            variance = np.var(normalized)
+            
+            # Simple model: coherence time inversely related to variance
+            # Scale factor empirically calibrated
+            if variance > 0.01:
+                coherence_time = 1.0 / (variance * 10)  # Rough estimate
+                coherence_time = np.clip(coherence_time, 0.1, 10.0)
+            else:
+                coherence_time = 10.0  # Stable channel
+            
+            return float(coherence_time)
+        
+        return None
+    
+    def _estimate_snr_with_gain(self, audio_signal: np.ndarray, 
+                                 noise_score: float, chirp_score: float) -> float:
+        """
+        Estimate SNR accounting for matched filter processing gain
+        
+        The white noise and chirp matched filters provide significant
+        processing gain that should be factored into the SNR estimate.
+        
+        Args:
+            audio_signal: Demodulated audio
+            noise_score: Score from white noise matched filter
+            chirp_score: Score from chirp matched filter
+            
+        Returns:
+            SNR in dB (with processing gain consideration)
+        """
+        # Base SNR from signal-to-noise in multitone region
+        start_idx = int(self.MULTITONE_START * self.sample_rate)
+        end_idx = int(self.MULTITONE_END * self.sample_rate)
+        
+        if end_idx > len(audio_signal):
+            end_idx = len(audio_signal)
+        
+        signal_segment = audio_signal[start_idx:end_idx]
+        signal_power = np.mean(signal_segment**2)
+        
+        # Noise from voice segment (0-10s, before test signal content)
+        noise_end = int(8.0 * self.sample_rate)  # Use 0-8s for noise estimate
+        noise_segment = audio_signal[:noise_end]
+        noise_power = np.mean(noise_segment**2) if len(noise_segment) > 0 else 1e-10
+        
+        # Base SNR
+        base_snr_db = 10 * np.log10(signal_power / (noise_power + 1e-10))
+        
+        # Processing gain from matched filters
+        # White noise: BT ≈ 10000 → 40 dB gain (but score < 1 means less coherent)
+        noise_gain_db = 40.0 * noise_score if noise_score > 0.1 else 0.0
+        
+        # Chirp: BT ≈ 5000 → 37 dB gain
+        chirp_gain_db = 37.0 * chirp_score if chirp_score > 0.1 else 0.0
+        
+        # Use the better of the two gains
+        processing_gain_db = max(noise_gain_db, chirp_gain_db)
+        
+        # Effective SNR (what matched filter sees)
+        effective_snr_db = base_snr_db + processing_gain_db
+        
+        logger.debug(f"SNR estimate: base={base_snr_db:.1f}dB, "
+                    f"processing_gain={processing_gain_db:.1f}dB, "
+                    f"effective={effective_snr_db:.1f}dB")
+        
+        return float(base_snr_db)  # Return base SNR, note processing gain in logs
+    
+    def _calculate_frequency_selectivity(self, audio_signal: np.ndarray) -> Tuple[Optional[float], Dict[int, float]]:
+        """
+        Calculate Frequency Selectivity Score (FSS) from multi-tone segment
+        
+        FSS = 10*log10((P_2kHz + P_3kHz) / (P_4kHz + P_5kHz))
+        
+        The ionosphere typically attenuates higher frequencies more than lower.
+        This creates a path-specific "fingerprint" that can help confirm station identity:
+        - WWV (continental path, shorter): typically lower FSS (less selective fading)
+        - WWVH (trans-oceanic, longer): typically higher FSS (more high-freq attenuation)
+        
+        Returns:
+            (fss_db, tone_powers_dict) where tone_powers_dict is {freq_hz: power_db}
+        """
+        from scipy.fft import rfft, rfftfreq
+        
+        # Extract multi-tone segment (13-23s)
+        start_idx = int(self.MULTITONE_START * self.sample_rate)
+        end_idx = int(self.MULTITONE_END * self.sample_rate)
+        
+        if end_idx > len(audio_signal):
+            return None, {}
+        
+        multitone_segment = audio_signal[start_idx:end_idx]
+        
+        # Measure power at each tone frequency
+        # Use a 1-second window in the middle of the segment (before heavy attenuation)
+        window_start = int(2 * self.sample_rate)  # 2 seconds into multitone
+        window_end = window_start + self.sample_rate
+        
+        if window_end > len(multitone_segment):
+            window_end = len(multitone_segment)
+            window_start = max(0, window_end - self.sample_rate)
+        
+        window = multitone_segment[window_start:window_end]
+        
+        # FFT
+        fft_result = np.abs(rfft(window))
+        freqs = rfftfreq(len(window), 1/self.sample_rate)
+        
+        # Measure power at each tone (peak within ±50 Hz)
+        tone_powers = {}
+        for freq in self.TONE_FREQUENCIES:
+            idx = np.argmin(np.abs(freqs - freq))
+            # Search window for peak
+            search_range = int(50 / (freqs[1] - freqs[0])) if len(freqs) > 1 else 5
+            start = max(0, idx - search_range)
+            end = min(len(fft_result), idx + search_range + 1)
+            
+            peak_power = np.max(fft_result[start:end]**2)
+            tone_powers[freq] = 10 * np.log10(peak_power + 1e-10)
+        
+        # Calculate FSS = 10*log10((P_2k + P_3k) / (P_4k + P_5k))
+        if all(f in tone_powers for f in [2000, 3000, 4000, 5000]):
+            p_low = 10**(tone_powers[2000]/10) + 10**(tone_powers[3000]/10)
+            p_high = 10**(tone_powers[4000]/10) + 10**(tone_powers[5000]/10)
+            
+            if p_high > 1e-10:
+                fss_db = 10 * np.log10(p_low / p_high)
+            else:
+                fss_db = None
+        else:
+            fss_db = None
+        
+        logger.debug(f"Frequency selectivity: FSS={fss_db:.1f}dB" if fss_db else "FSS calculation failed")
+        logger.debug(f"  Tone powers: {tone_powers}")
+        
+        return fss_db, tone_powers
+    
+    def _detect_single_cycle_bursts(self, audio_signal: np.ndarray) -> Tuple[float, Optional[float]]:
+        """
+        Detect single-cycle bursts for high-precision ToA
+        
+        The test signal contains 5 bursts at 2.5 kHz then 5 at 5 kHz (34-36s).
+        These are the shortest features, providing the highest time resolution.
+        
+        Returns:
+            (burst_score, toa_offset_ms) - ToA offset from expected burst start
+        """
+        from scipy.fft import rfft, rfftfreq
+        
+        # Extract burst segment (34-36s)
+        start_idx = int(self.BURST_START * self.sample_rate)
+        end_idx = int(self.BURST_END * self.sample_rate)
+        
+        if end_idx > len(audio_signal):
+            return 0.0, None
+        
+        burst_segment = audio_signal[start_idx:end_idx]
+        
+        # The bursts are single-cycle, so look for impulsive energy
+        # at 2.5 kHz (first second) and 5 kHz (second second)
+        
+        # Generate single-cycle templates
+        t_25 = np.arange(0, 1/2500, 1/self.sample_rate)
+        burst_template_25 = np.sin(2 * np.pi * 2500 * t_25)
+        
+        t_50 = np.arange(0, 1/5000, 1/self.sample_rate)
+        burst_template_50 = np.sin(2 * np.pi * 5000 * t_50)
+        
+        # Correlate with templates
+        # First half: 2.5 kHz bursts (5 bursts over 1 second, ~200ms apart)
+        first_half = burst_segment[:len(burst_segment)//2]
+        corr_25 = signal.correlate(first_half, burst_template_25, mode='valid')
+        
+        # Second half: 5 kHz bursts
+        second_half = burst_segment[len(burst_segment)//2:]
+        corr_50 = signal.correlate(second_half, burst_template_50, mode='valid')
+        
+        # Find peaks (should be 5 in each half)
+        # Simple peak detection
+        peak_25 = np.max(np.abs(corr_25)) if len(corr_25) > 0 else 0
+        peak_50 = np.max(np.abs(corr_50)) if len(corr_50) > 0 else 0
+        
+        # Score based on peak prominence
+        noise_25 = np.std(corr_25) if len(corr_25) > 10 else 1e-10
+        noise_50 = np.std(corr_50) if len(corr_50) > 10 else 1e-10
+        
+        snr_25 = peak_25 / (noise_25 + 1e-10)
+        snr_50 = peak_50 / (noise_50 + 1e-10)
+        
+        # Combined score (both burst types should be present)
+        score = np.clip((snr_25 + snr_50) / 20.0, 0.0, 1.0)  # Normalized
+        
+        # ToA from first burst peak
+        toa_offset_ms = None
+        if score > 0.1 and len(corr_25) > 0:
+            first_peak_idx = np.argmax(np.abs(corr_25))
+            # Expected first burst at t=0 within burst segment
+            # Actual arrival = first_peak_idx / sample_rate
+            toa_offset_ms = (first_peak_idx / self.sample_rate) * 1000.0
+        
+        logger.debug(f"Burst detection: score={score:.3f}, SNR_2.5k={snr_25:.1f}, SNR_5k={snr_50:.1f}")
+        
+        return score, toa_offset_ms
+    
+    def _detect_both_noise_segments(self, audio_signal: np.ndarray) -> Tuple[float, float, Optional[float]]:
+        """
+        Analyze both white noise segments for transient interference detection
+        
+        Noise #1 (10-12s) and Noise #2 (37-39s) should have identical characteristics
+        since they are the same sequence. Large differences indicate a transient
+        event (interference, fading) occurred between them.
+        
+        Returns:
+            (noise1_score, noise2_score, coherence_diff)
+            coherence_diff = |noise1_score - noise2_score|, high = transient event
+        """
+        from scipy.fft import rfft
+        
+        # Extract both noise segments
+        n1_start = int(self.NOISE1_START * self.sample_rate)
+        n1_end = int(self.NOISE1_END * self.sample_rate)
+        n2_start = int(self.NOISE2_START * self.sample_rate)
+        n2_end = int(self.NOISE2_END * self.sample_rate)
+        
+        if n2_end > len(audio_signal):
+            return 0.0, 0.0, None
+        
+        noise1 = audio_signal[n1_start:n1_end]
+        noise2 = audio_signal[n2_start:n2_end]
+        
+        def analyze_noise_segment(segment: np.ndarray, pre_segment: np.ndarray) -> float:
+            """Analyze a single noise segment using energy and spectral flatness"""
+            noise_power = np.mean(segment**2)
+            pre_power = np.mean(pre_segment**2) if len(pre_segment) > 0 else 1e-10
+            
+            # Energy ratio
+            energy_ratio = noise_power / (pre_power + 1e-10)
+            
+            # Spectral flatness
+            fft_result = np.abs(rfft(segment[:self.sample_rate]))
+            fft_power = fft_result[10:]**2
+            
+            if len(fft_power) > 0 and np.all(fft_power > 0):
+                geometric_mean = np.exp(np.mean(np.log(fft_power + 1e-10)))
+                arithmetic_mean = np.mean(fft_power)
+                flatness = geometric_mean / (arithmetic_mean + 1e-10)
+            else:
+                flatness = 0.0
+            
+            energy_score = np.clip((energy_ratio - 1.0) / 5.0, 0.0, 1.0)
+            flatness_score = np.clip(flatness * 2.0, 0.0, 1.0)
+            
+            return 0.5 * energy_score + 0.5 * flatness_score
+        
+        # Pre-segments for comparison (2s before each noise segment)
+        pre1_start = max(0, n1_start - 2 * self.sample_rate)
+        pre1 = audio_signal[pre1_start:n1_start]
+        
+        pre2_start = max(0, n2_start - 2 * self.sample_rate)
+        pre2 = audio_signal[pre2_start:n2_start]
+        
+        noise1_score = analyze_noise_segment(noise1, pre1)
+        noise2_score = analyze_noise_segment(noise2, pre2)
+        
+        # Coherence difference - should be small if no transients
+        coherence_diff = abs(noise1_score - noise2_score)
+        
+        logger.debug(f"Noise segment analysis: N1={noise1_score:.3f}, N2={noise2_score:.3f}, "
+                    f"diff={coherence_diff:.3f}")
+        
+        return noise1_score, noise2_score, coherence_diff
+
+
+# Convenience function for integration
+def detect_test_signal(
+    iq_samples: np.ndarray,
+    sample_rate: int,
+    minute_number: int
+) -> TestSignalDetection:
+    """
+    Convenience function to detect test signal
+    
+    Args:
+        iq_samples: Complex IQ samples
+        sample_rate: Sample rate in Hz
+        minute_number: Minute of hour (0-59)
+        
+    Returns:
+        TestSignalDetection object
+    """
+    detector = WWVTestSignalDetector(sample_rate)
+    return detector.detect(iq_samples, minute_number, sample_rate)

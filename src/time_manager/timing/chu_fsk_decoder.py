@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""
+CHU FSK Time Code Decoder
+
+Decodes the Bell 103 compatible FSK time code broadcast by CHU (Canada)
+during seconds 31-39 of each minute. This provides:
+- Precise timing reference (500ms boundary)
+- Time verification (decoded UTC time)
+- DUT1 correction (UT1-UTC offset)
+- TAI-UTC offset (leap seconds)
+- Channel quality metric (decode success rate)
+
+CHU FSK Signal Structure:
+-------------------------
+- Frequencies: 2225 Hz (mark), 2025 Hz (space)
+- Baud rate: 300 bps (3.333ms per bit)
+- Frame format: 1 start + 8 data + 2 stop = 11 bits per byte
+- 10 bytes per second (5 data + 5 redundancy)
+
+Timing per second (31-39):
+- 0-10ms: 1000 Hz tick (10 cycles)
+- 10-133ms: Mark tone (2225 Hz modem sync)
+- 133-500ms: Data stream (110 bits @ 300 baud = 366.67ms)
+- Last stop bit ends at EXACTLY 500ms - this is our precise timing reference!
+
+Frame Types:
+- Frame A (seconds 32-39): 6d dd hh mm ss (BCD day/time)
+- Frame B (second 31): xz yy yy tt aa (DUT1, year, TAI-UTC, DST pattern)
+
+Author: GRAPE Recorder Team
+"""
+
+import numpy as np
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict
+from scipy.signal import butter, filtfilt, hilbert
+
+logger = logging.getLogger(__name__)
+
+# FSK Constants
+MARK_FREQ = 2225.0  # Hz - logic 1
+SPACE_FREQ = 2025.0  # Hz - logic 0
+BAUD_RATE = 300  # bits per second
+BIT_DURATION_MS = 1000.0 / BAUD_RATE  # 3.333... ms
+
+# Frame timing (relative to second boundary)
+TICK_END_MS = 10.0  # End of 1000 Hz tick
+MARK_START_MS = 10.0  # Start of mark sync tone
+DATA_START_MS = 133.33  # Start of FSK data
+DATA_END_MS = 500.0  # End of FSK data (precise timing reference!)
+BITS_PER_FRAME = 110  # 10 bytes × 11 bits
+
+# Valid FSK seconds
+FSK_SECONDS = [31, 32, 33, 34, 35, 36, 37, 38, 39]
+
+
+@dataclass
+class CHUFrameA:
+    """Frame A: Time of day (seconds 32-39)"""
+    day_of_year: int  # 1-366
+    hour: int  # 0-23
+    minute: int  # 0-59
+    second: int  # 32-39
+    valid: bool = False
+    
+    def __str__(self):
+        return f"Day {self.day_of_year:03d} {self.hour:02d}:{self.minute:02d}:{self.second:02d} UTC"
+
+
+@dataclass
+class CHUFrameB:
+    """Frame B: Auxiliary data (second 31)"""
+    dut1_tenths: int  # Absolute value of DUT1 in 0.1s
+    dut1_negative: bool  # True if DUT1 is negative
+    year: int  # Gregorian year (4 digits)
+    tai_utc: int  # TAI - UTC in seconds (leap second count)
+    dst_pattern: int  # Canadian DST pattern code
+    valid: bool = False
+    
+    @property
+    def dut1_seconds(self) -> float:
+        """Get DUT1 in seconds (signed)"""
+        return -self.dut1_tenths / 10.0 if self.dut1_negative else self.dut1_tenths / 10.0
+    
+    def __str__(self):
+        sign = '-' if self.dut1_negative else '+'
+        return f"Year {self.year}, DUT1={sign}{self.dut1_tenths/10:.1f}s, TAI-UTC={self.tai_utc}s"
+
+
+@dataclass
+class CHUFSKResult:
+    """Result of CHU FSK decoding for one minute"""
+    detected: bool = False
+    frames_decoded: int = 0
+    frames_total: int = 9  # Seconds 31-39
+    
+    # Decoded time (from Frame A)
+    decoded_day: Optional[int] = None
+    decoded_hour: Optional[int] = None
+    decoded_minute: Optional[int] = None
+    
+    # Auxiliary data (from Frame B)
+    dut1_seconds: Optional[float] = None
+    year: Optional[int] = None
+    tai_utc: Optional[int] = None
+    
+    # Timing precision
+    timing_offset_ms: Optional[float] = None  # Measured vs expected 500ms boundary
+    
+    # Quality metrics
+    snr_db: Optional[float] = None  # FSK signal SNR
+    bit_error_rate: Optional[float] = None  # Estimated BER from redundancy
+    decode_confidence: float = 0.0  # 0-1 based on frame decode success
+    
+    # Per-second details
+    frame_results: List[Dict] = field(default_factory=list)
+
+
+class CHUFSKDecoder:
+    """
+    Decode CHU FSK time code for precise timing and time verification.
+    
+    Usage:
+        decoder = CHUFSKDecoder(sample_rate=20000)
+        result = decoder.decode_minute(iq_samples, minute_boundary_unix)
+        
+        if result.detected:
+            print(f"Decoded time: Day {result.decoded_day} {result.decoded_hour}:{result.decoded_minute}")
+            print(f"Timing offset: {result.timing_offset_ms:.3f} ms")
+            print(f"DUT1: {result.dut1_seconds:.1f} s")
+    """
+    
+    def __init__(self, sample_rate: int = 20000, channel_name: str = "CHU"):
+        self.sample_rate = sample_rate
+        self.channel_name = channel_name
+        
+        # Pre-calculate filter coefficients for mark/space detection
+        # Bandpass filters centered on mark and space frequencies
+        self.mark_filter = self._design_bandpass(MARK_FREQ, bandwidth=100)
+        self.space_filter = self._design_bandpass(SPACE_FREQ, bandwidth=100)
+        
+        # Samples per bit
+        self.samples_per_bit = int(sample_rate / BAUD_RATE)
+        
+        logger.debug(f"CHU FSK Decoder initialized: {sample_rate} Hz, {self.samples_per_bit} samples/bit")
+    
+    def _design_bandpass(self, center_freq: float, bandwidth: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Design a bandpass filter for mark or space frequency"""
+        nyq = self.sample_rate / 2
+        low = (center_freq - bandwidth/2) / nyq
+        high = (center_freq + bandwidth/2) / nyq
+        
+        # Ensure valid range
+        low = max(0.01, min(low, 0.99))
+        high = max(low + 0.01, min(high, 0.99))
+        
+        b, a = butter(4, [low, high], btype='band')
+        return b, a
+    
+    def _am_demodulate(self, iq_samples: np.ndarray) -> np.ndarray:
+        """AM demodulate IQ samples to audio"""
+        magnitude = np.abs(iq_samples)
+        audio = magnitude - np.mean(magnitude)
+        return audio.astype(np.float64)
+    
+    def _fsk_demodulate(self, audio: np.ndarray) -> np.ndarray:
+        """
+        FSK demodulation using mark/space power comparison.
+        Returns array of soft decisions (-1 to +1, positive = mark)
+        """
+        # Apply bandpass filters
+        mark_signal = filtfilt(self.mark_filter[0], self.mark_filter[1], audio)
+        space_signal = filtfilt(self.space_filter[0], self.space_filter[1], audio)
+        
+        # Envelope detection
+        mark_power = np.abs(hilbert(mark_signal)) ** 2
+        space_power = np.abs(hilbert(space_signal)) ** 2
+        
+        # Soft decision: positive = mark, negative = space
+        # Normalize to prevent division issues
+        total_power = mark_power + space_power + 1e-10
+        soft_decision = (mark_power - space_power) / total_power
+        
+        return soft_decision
+    
+    def _extract_bits(self, soft_decision: np.ndarray, start_sample: int, num_bits: int) -> Tuple[List[int], float]:
+        """
+        Extract bits from soft decision signal.
+        
+        Returns:
+            bits: List of decoded bits (0 or 1)
+            confidence: Average absolute soft decision value
+        """
+        bits = []
+        confidences = []
+        
+        for i in range(num_bits):
+            bit_start = start_sample + int(i * self.samples_per_bit)
+            bit_end = bit_start + self.samples_per_bit
+            
+            if bit_end > len(soft_decision):
+                break
+            
+            # Sample in middle of bit for best decision
+            mid_start = bit_start + self.samples_per_bit // 4
+            mid_end = bit_start + 3 * self.samples_per_bit // 4
+            bit_value = np.mean(soft_decision[mid_start:mid_end])
+            
+            bits.append(1 if bit_value > 0 else 0)
+            confidences.append(abs(bit_value))
+        
+        avg_confidence = np.mean(confidences) if confidences else 0.0
+        return bits, avg_confidence
+    
+    def _bits_to_bytes(self, bits: List[int]) -> List[int]:
+        """
+        Convert bit stream to bytes (1 start + 8 data + 2 stop = 11 bits per byte)
+        
+        Returns list of decoded bytes, or empty list if framing error
+        """
+        bytes_out = []
+        
+        for byte_num in range(10):  # 10 bytes per frame
+            bit_offset = byte_num * 11
+            
+            if bit_offset + 11 > len(bits):
+                break
+            
+            # Check start bit (should be 0/space)
+            start_bit = bits[bit_offset]
+            if start_bit != 0:
+                logger.debug(f"Framing error: start bit is 1 at byte {byte_num}")
+                continue
+            
+            # Extract 8 data bits (LSB first)
+            data_byte = 0
+            for i in range(8):
+                if bits[bit_offset + 1 + i]:
+                    data_byte |= (1 << i)
+            
+            # Check stop bits (should be 1/mark)
+            stop1 = bits[bit_offset + 9]
+            stop2 = bits[bit_offset + 10]
+            if stop1 != 1 or stop2 != 1:
+                logger.debug(f"Framing error: stop bits wrong at byte {byte_num}")
+            
+            bytes_out.append(data_byte)
+        
+        return bytes_out
+    
+    def _swap_nibbles(self, byte_val: int) -> int:
+        """Swap least and most significant nibbles in a byte"""
+        return ((byte_val & 0x0F) << 4) | ((byte_val & 0xF0) >> 4)
+    
+    def _decode_frame_a(self, raw_bytes: List[int]) -> Optional[CHUFrameA]:
+        """Decode Frame A (time of day) from raw bytes"""
+        if len(raw_bytes) < 10:
+            return None
+        
+        # Check redundancy (bytes 5-9 should equal bytes 0-4)
+        data_bytes = raw_bytes[:5]
+        redundancy = raw_bytes[5:10]
+        
+        if data_bytes != redundancy:
+            logger.debug("Frame A redundancy check failed")
+            return None
+        
+        # Swap nibbles in each byte
+        swapped = [self._swap_nibbles(b) for b in data_bytes]
+        
+        # Parse BCD: 6d dd hh mm ss
+        # Byte 0: 0x6d where d is high digit of day
+        marker = (swapped[0] >> 4) & 0x0F
+        if marker != 6:
+            logger.debug(f"Frame A marker invalid: {marker}")
+            return None
+        
+        day_high = swapped[0] & 0x0F
+        day_mid = (swapped[1] >> 4) & 0x0F
+        day_low = swapped[1] & 0x0F
+        day = day_high * 100 + day_mid * 10 + day_low
+        
+        hour_high = (swapped[2] >> 4) & 0x0F
+        hour_low = swapped[2] & 0x0F
+        hour = hour_high * 10 + hour_low
+        
+        min_high = (swapped[3] >> 4) & 0x0F
+        min_low = swapped[3] & 0x0F
+        minute = min_high * 10 + min_low
+        
+        sec_high = (swapped[4] >> 4) & 0x0F
+        sec_low = swapped[4] & 0x0F
+        second = sec_high * 10 + sec_low
+        
+        # Validate ranges
+        if not (1 <= day <= 366 and 0 <= hour <= 23 and 0 <= minute <= 59 and 32 <= second <= 39):
+            logger.debug(f"Frame A values out of range: day={day}, hour={hour}, min={minute}, sec={second}")
+            return None
+        
+        return CHUFrameA(
+            day_of_year=day,
+            hour=hour,
+            minute=minute,
+            second=second,
+            valid=True
+        )
+    
+    def _decode_frame_b(self, raw_bytes: List[int]) -> Optional[CHUFrameB]:
+        """Decode Frame B (auxiliary data) from raw bytes"""
+        if len(raw_bytes) < 10:
+            return None
+        
+        # Check redundancy (bytes 5-9 should be inverted bytes 0-4)
+        data_bytes = raw_bytes[:5]
+        redundancy = raw_bytes[5:10]
+        
+        inverted = [(~b) & 0xFF for b in data_bytes]
+        if inverted != redundancy:
+            logger.debug("Frame B redundancy check failed")
+            return None
+        
+        # Swap nibbles in each byte
+        swapped = [self._swap_nibbles(b) for b in data_bytes]
+        
+        # Parse: xz yy yy tt aa
+        # x: DUT1 sign (even = positive, odd = negative)
+        # z: |DUT1| in tenths of seconds
+        x_nibble = (swapped[0] >> 4) & 0x0F
+        z_nibble = swapped[0] & 0x0F
+        
+        dut1_negative = (x_nibble % 2) == 1
+        dut1_tenths = z_nibble
+        
+        # Year (4 BCD digits in bytes 1-2)
+        year_1000 = (swapped[1] >> 4) & 0x0F
+        year_100 = swapped[1] & 0x0F
+        year_10 = (swapped[2] >> 4) & 0x0F
+        year_1 = swapped[2] & 0x0F
+        year = year_1000 * 1000 + year_100 * 100 + year_10 * 10 + year_1
+        
+        # TAI-UTC (2 BCD digits)
+        tai_high = (swapped[3] >> 4) & 0x0F
+        tai_low = swapped[3] & 0x0F
+        tai_utc = tai_high * 10 + tai_low
+        
+        # DST pattern (2 BCD digits)
+        dst_high = (swapped[4] >> 4) & 0x0F
+        dst_low = swapped[4] & 0x0F
+        dst_pattern = dst_high * 10 + dst_low
+        
+        # Validate
+        if not (1990 <= year <= 2100 and 0 <= tai_utc <= 99):
+            logger.debug(f"Frame B values out of range: year={year}, tai_utc={tai_utc}")
+            return None
+        
+        return CHUFrameB(
+            dut1_tenths=dut1_tenths,
+            dut1_negative=dut1_negative,
+            year=year,
+            tai_utc=tai_utc,
+            dst_pattern=dst_pattern,
+            valid=True
+        )
+    
+    def decode_second(
+        self,
+        audio: np.ndarray,
+        second_start_sample: int,
+        second_number: int
+    ) -> Tuple[Optional[object], float, float]:
+        """
+        Decode one second of CHU FSK data.
+        
+        Args:
+            audio: AM demodulated audio signal
+            second_start_sample: Sample index of second boundary
+            second_number: Second within minute (31-39)
+            
+        Returns:
+            frame: CHUFrameA or CHUFrameB if decoded, None otherwise
+            timing_offset_ms: Measured timing offset from expected 500ms boundary
+            confidence: Decode confidence (0-1)
+        """
+        # FSK demodulate
+        soft_decision = self._fsk_demodulate(audio)
+        
+        # Calculate expected data start (133.33ms into second)
+        data_start_sample = second_start_sample + int(DATA_START_MS * self.sample_rate / 1000)
+        
+        # Extract bits
+        bits, bit_confidence = self._extract_bits(soft_decision, data_start_sample, BITS_PER_FRAME)
+        
+        if len(bits) < BITS_PER_FRAME:
+            return None, 0.0, 0.0
+        
+        # Convert to bytes
+        raw_bytes = self._bits_to_bytes(bits)
+        
+        if len(raw_bytes) < 10:
+            return None, 0.0, bit_confidence
+        
+        # Decode based on second number
+        if second_number == 31:
+            frame = self._decode_frame_b(raw_bytes)
+        else:
+            frame = self._decode_frame_a(raw_bytes)
+        
+        # Measure timing offset from 500ms boundary
+        # The last stop bit should end at exactly 500ms
+        # Find where the mark tone ends (transition to silence)
+        expected_end_sample = second_start_sample + int(DATA_END_MS * self.sample_rate / 1000)
+        
+        # Look for mark-to-silence transition near expected end
+        search_window = int(10 * self.sample_rate / 1000)  # ±10ms
+        window_start = max(0, expected_end_sample - search_window)
+        window_end = min(len(soft_decision), expected_end_sample + search_window)
+        
+        if window_end > window_start:
+            window = soft_decision[window_start:window_end]
+            # Find where soft decision drops (mark ends)
+            threshold = np.mean(window) * 0.5
+            transitions = np.where(np.diff(window > threshold))[0]
+            
+            if len(transitions) > 0:
+                actual_end = window_start + transitions[-1]
+                timing_offset_ms = (actual_end - expected_end_sample) / self.sample_rate * 1000
+            else:
+                timing_offset_ms = 0.0
+        else:
+            timing_offset_ms = 0.0
+        
+        return frame, timing_offset_ms, bit_confidence
+    
+    def decode_minute(
+        self,
+        iq_samples: np.ndarray,
+        minute_boundary_unix: float
+    ) -> CHUFSKResult:
+        """
+        Decode CHU FSK time code for an entire minute.
+        
+        Processes seconds 31-39 to extract:
+        - Time verification from Frame A
+        - DUT1, year, TAI-UTC from Frame B
+        - Precise timing reference from 500ms boundaries
+        
+        Args:
+            iq_samples: 60 seconds of IQ data at sample_rate
+            minute_boundary_unix: Unix timestamp of minute start
+            
+        Returns:
+            CHUFSKResult with decoded data and quality metrics
+        """
+        result = CHUFSKResult()
+        
+        # AM demodulate entire buffer
+        audio = self._am_demodulate(iq_samples)
+        
+        frame_a_results: List[CHUFrameA] = []
+        frame_b_result: Optional[CHUFrameB] = None
+        timing_offsets: List[float] = []
+        confidences: List[float] = []
+        
+        for second in FSK_SECONDS:
+            # Calculate second start sample
+            second_start_sample = int(second * self.sample_rate)
+            
+            if second_start_sample + int(1.0 * self.sample_rate) > len(audio):
+                logger.debug(f"Insufficient data for second {second}")
+                continue
+            
+            try:
+                frame, timing_offset, confidence = self.decode_second(
+                    audio, second_start_sample, second
+                )
+                
+                result.frame_results.append({
+                    'second': second,
+                    'decoded': frame is not None,
+                    'timing_offset_ms': timing_offset,
+                    'confidence': confidence
+                })
+                
+                if frame is not None:
+                    result.frames_decoded += 1
+                    
+                    if isinstance(frame, CHUFrameA):
+                        frame_a_results.append(frame)
+                    elif isinstance(frame, CHUFrameB):
+                        frame_b_result = frame
+                    
+                    timing_offsets.append(timing_offset)
+                    confidences.append(confidence)
+                    
+            except Exception as e:
+                logger.debug(f"Error decoding second {second}: {e}")
+        
+        # Aggregate results
+        if result.frames_decoded > 0:
+            result.detected = True
+            result.decode_confidence = result.frames_decoded / result.frames_total
+            
+            # Use consensus from Frame A for time
+            if frame_a_results:
+                # Use most common values
+                days = [f.day_of_year for f in frame_a_results]
+                hours = [f.hour for f in frame_a_results]
+                minutes = [f.minute for f in frame_a_results]
+                
+                result.decoded_day = max(set(days), key=days.count)
+                result.decoded_hour = max(set(hours), key=hours.count)
+                result.decoded_minute = max(set(minutes), key=minutes.count)
+            
+            # Get auxiliary data from Frame B
+            if frame_b_result:
+                result.dut1_seconds = frame_b_result.dut1_seconds
+                result.year = frame_b_result.year
+                result.tai_utc = frame_b_result.tai_utc
+            
+            # Timing precision from 500ms boundaries
+            if timing_offsets:
+                result.timing_offset_ms = np.mean(timing_offsets)
+            
+            # Estimate BER from redundancy failures
+            frames_attempted = len(result.frame_results)
+            if frames_attempted > 0:
+                result.bit_error_rate = 1.0 - (result.frames_decoded / frames_attempted)
+            
+            logger.info(
+                f"{self.channel_name} FSK: Decoded {result.frames_decoded}/{result.frames_total} frames, "
+                f"timing_offset={result.timing_offset_ms:.3f}ms, confidence={result.decode_confidence:.2f}"
+            )
+            
+            if result.dut1_seconds is not None:
+                logger.info(
+                    f"{self.channel_name} FSK: Year={result.year}, "
+                    f"DUT1={result.dut1_seconds:+.1f}s, TAI-UTC={result.tai_utc}s"
+                )
+        
+        return result
