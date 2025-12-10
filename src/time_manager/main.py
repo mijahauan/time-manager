@@ -560,53 +560,60 @@ class TimeManagerDaemon:
             logger.error("No data found to reprocess")
             return
         
-        # Find common minutes (present in all channels) or process per-channel
-        # For now, process the most recent N minutes from each channel
+        # Find common minutes across all channels for proper fusion
+        # Get union of all minutes, then filter to most recent N
+        all_minute_set = set()
+        for minutes in all_minutes.values():
+            all_minute_set.update(minutes)
+        
+        sorted_minutes = sorted(all_minute_set)[-num_minutes:]
+        logger.info(f"\nProcessing {len(sorted_minutes)} minutes with multi-channel fusion")
+        
         processed_count = 0
         
-        for channel_name, engine in engines_to_process.items():
-            if engine is None:
-                continue
+        for minute in sorted_minutes:
+            channel_results: Dict[str, ChannelTimingResult] = {}
             
-            minutes = all_minutes.get(channel_name, [])
-            if not minutes:
-                continue
-            
-            # Take the most recent N minutes
-            minutes_to_process = minutes[-num_minutes:]
-            
-            logger.info(f"\nProcessing {channel_name}: {len(minutes_to_process)} minutes")
-            
-            for minute in minutes_to_process:
+            # Process all channels for this minute
+            for channel_name, engine in engines_to_process.items():
+                if engine is None:
+                    continue
+                
+                # Check if this channel has data for this minute
+                if minute not in all_minutes.get(channel_name, []):
+                    continue
+                
                 result = self._process_channel_minute(channel_name, engine, minute)
                 
                 if result:
-                    logger.info(
-                        f"  Minute {minute}: d_clock={result.d_clock_raw_ms:+.2f}ms, "
-                        f"station={result.station}, SNR={result.snr_db:.1f}dB"
-                        if result.snr_db else
-                        f"  Minute {minute}: d_clock={result.d_clock_raw_ms}ms, station={result.station}"
-                    )
-                    processed_count += 1
-                    
-                    # Write to SHM
-                    timing_result = TimingResult(
-                        timestamp=minute * 60,
-                        system_time=time.time(),
-                        d_clock_ms=result.d_clock_raw_ms or 0.0,
-                        d_clock_uncertainty_ms=result.uncertainty_ms,
-                        clock_status=ClockStatus.ACQUIRING,
-                        channels={channel_name: result},
-                        channels_active=1,
-                        channels_locked=1 if result.d_clock_raw_ms else 0,
-                        uptime_seconds=time.time() - self.start_time
-                    )
-                    self.shm_writer.write(timing_result)
-                else:
-                    logger.debug(f"  Minute {minute}: no result")
+                    channel_results[channel_name] = result
+            
+            # Log results for this minute
+            if channel_results:
+                processed_count += 1
+                
+                # Compute fused D_clock
+                self._fuse_and_publish(channel_results)
+                
+                # Log summary
+                d_clock_values = [
+                    f"{ch[:8]}={r.d_clock_raw_ms:+.1f}" 
+                    for ch, r in sorted(channel_results.items()) 
+                    if r.d_clock_raw_ms is not None
+                ]
+                logger.info(
+                    f"  Minute {minute}: {len(channel_results)} channels, "
+                    f"fused={self.d_clock_ms:+.2f}±{self.d_clock_uncertainty_ms:.2f}ms"
+                )
+                if len(d_clock_values) <= 5:
+                    logger.info(f"    {', '.join(d_clock_values)}")
+            else:
+                logger.debug(f"  Minute {minute}: no results")
         
         logger.info("=" * 60)
-        logger.info(f"Reprocessing complete: {processed_count} results")
+        logger.info(f"Reprocessing complete: {processed_count} fused minutes")
+        logger.info(f"Final D_clock: {self.d_clock_ms:+.2f} ± {self.d_clock_uncertainty_ms:.2f} ms")
+        logger.info(f"Clock status: {self.clock_status.value}")
         logger.info("=" * 60)
 
 
