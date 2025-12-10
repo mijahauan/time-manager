@@ -599,6 +599,7 @@ class LiveTimeEngine:
             return
         
         d_clock_values = []
+        minute_boundary = minute * 60  # UTC seconds
         
         for name, buffer in self.channel_buffers.items():
             state = self.channel_states.get(name)
@@ -607,37 +608,68 @@ class LiveTimeEngine:
                 logger.debug(f"  {name}: No valid state")
                 continue
             
-            # Get ring buffer samples
+            # Get ring buffer samples (3 seconds around minute boundary)
             samples, start_rtp = buffer.get_ring_samples()
             
-            if len(samples) < self.sample_rate:  # Need at least 1 second
+            if len(samples) < self.sample_rate * 2:  # Need at least 2 seconds
                 logger.debug(f"  {name}: Insufficient samples ({len(samples)})")
                 continue
             
-            # TODO: Run tone detection to find minute boundary
-            # For now, use state's propagation delay directly
-            # tone_time = self._detect_tone_fast(samples, start_rtp, name)
-            
-            # Calculate D_clock using previous state
-            # D_clock = Arrival_RTP - Propagation_Delay
-            # This is simplified - full implementation needs tone detection
-            d_clock = 0.0  # Placeholder
-            
-            if state.propagation_delay_ms > 0:
-                d_clock_values.append((d_clock, state.confidence))
-                logger.debug(f"  {name}: D_clock={d_clock:.2f}ms (using {state.station} {state.propagation_mode})")
+            try:
+                # Get or create tone detector for this channel
+                if name not in self._tone_detectors:
+                    from grape_recorder.grape.tone_detector import MultiStationToneDetector
+                    # Use 20kHz sample rate (full rate, not decimated)
+                    self._tone_detectors[name] = MultiStationToneDetector(name, self.sample_rate)
+                
+                detector = self._tone_detectors[name]
+                
+                # Calculate buffer start time from RTP
+                # buffer_start_time = start_rtp / self.sample_rate (if GPSDO-locked)
+                # For now, use wallclock estimate
+                buffer_start_time = buffer.last_wallclock - (len(samples) / self.sample_rate)
+                
+                # Run tone detection with narrow window (Fast Loop uses previous state)
+                detections = detector.process_samples(
+                    timestamp=buffer_start_time,
+                    samples=samples,
+                    rtp_timestamp=start_rtp,
+                    original_sample_rate=self.sample_rate,
+                    search_window_ms=100.0,  # Narrow ±100ms window
+                    expected_offset_ms=state.propagation_delay_ms  # Expected arrival
+                )
+                
+                if detections:
+                    # Use primary detection (highest priority station)
+                    primary = max(detections, key=lambda d: d.snr_db if d.snr_db else 0)
+                    
+                    # D_clock = T_arrival - T_propagation
+                    # timing_error_ms is offset from expected minute boundary
+                    d_clock = primary.timing_error_ms - state.propagation_delay_ms
+                    
+                    d_clock_values.append((d_clock, state.confidence, primary.snr_db or 1.0))
+                    logger.info(f"  {name}: D_clock={d_clock:+.2f}ms, SNR={primary.snr_db:.1f}dB")
+                else:
+                    logger.debug(f"  {name}: No tone detected")
+                    
+            except Exception as e:
+                logger.warning(f"  {name}: Tone detection failed: {e}")
         
         if d_clock_values:
-            # Weighted average
-            total_weight = sum(conf for _, conf in d_clock_values)
+            # Weighted average (weight by confidence * SNR)
+            total_weight = sum(conf * snr for _, conf, snr in d_clock_values)
             if total_weight > 0:
-                self.d_clock_ms = sum(d * c for d, c in d_clock_values) / total_weight
+                self.d_clock_ms = sum(d * conf * snr for d, conf, snr in d_clock_values) / total_weight
+                self.d_clock_uncertainty_ms = 5.0 / len(d_clock_values)  # Rough estimate
             
-            # Update Chrony if enabled
-            if self.enable_chrony and self.chrony_shm:
+            # Update Chrony if enabled and have good data
+            if self.enable_chrony and self.chrony_shm and len(d_clock_values) >= 2:
                 self._update_chrony()
+                self.stats['chrony_updates'] += 1
             
-            logger.info(f"  Fast Loop result: D_clock={self.d_clock_ms:.2f}ms")
+            logger.info(f"  Fast Loop result: D_clock={self.d_clock_ms:+.2f}ms from {len(d_clock_values)} channels")
+        else:
+            logger.warning(f"  Fast Loop: No valid detections")
     
     def _slow_loop(self):
         """
@@ -699,42 +731,96 @@ class LiveTimeEngine:
         
         results = {}
         
+        # Get or create Phase2 engines for full analysis
+        if not hasattr(self, '_phase2_engines'):
+            self._phase2_engines = {}
+        
         for name, buffer in self.channel_buffers.items():
             # Get full minute samples
             samples, start_rtp = buffer.get_full_samples()
             
             if len(samples) < self.sample_rate * 30:  # Need at least 30 seconds
                 logger.debug(f"  {name}: Insufficient samples ({len(samples)})")
+                buffer.reset_for_new_minute()
                 continue
             
-            # TODO: Run full discrimination
-            # - BCD correlation
-            # - Doppler analysis
-            # - FSS calculation
-            # - Station identification
-            
-            # For now, use placeholder results
-            result = {
-                'station': 'WWV',
-                'propagation_mode': '1F',
-                'propagation_delay_ms': 6.0,
-                'snr_db': 20.0,
-                'confidence': 0.8
-            }
-            
-            results[name] = result
-            
-            # Update channel state for next Fast Loop
-            state = self.channel_states[name]
-            state.station = result['station']
-            state.propagation_mode = result['propagation_mode']
-            state.propagation_delay_ms = result['propagation_delay_ms']
-            state.snr_db = result['snr_db']
-            state.confidence = result['confidence']
-            state.last_update_minute = minute
-            
-            logger.info(f"  {name}: {result['station']} {result['propagation_mode']} "
-                       f"delay={result['propagation_delay_ms']:.1f}ms")
+            try:
+                # Get or create Phase2 engine for this channel
+                if name not in self._phase2_engines:
+                    from grape_recorder.grape.phase2_temporal_engine import Phase2TemporalEngine
+                    from pathlib import Path
+                    
+                    # Extract frequency from channel name
+                    freq_hz = next(
+                        (ch['frequency_hz'] for ch in self.channels if ch['name'] == name),
+                        10000000  # Default 10 MHz
+                    )
+                    
+                    self._phase2_engines[name] = Phase2TemporalEngine(
+                        raw_archive_dir=Path("/tmp"),  # Not used for RAM processing
+                        output_dir=Path("/tmp"),       # Not used
+                        channel_name=name,
+                        frequency_hz=freq_hz,
+                        receiver_grid=self.receiver_grid,
+                        sample_rate=self.sample_rate,
+                        precise_lat=self.receiver_lat,
+                        precise_lon=self.receiver_lon
+                    )
+                
+                engine = self._phase2_engines[name]
+                
+                # Calculate system time for this minute
+                system_time = float(minute * 60)
+                
+                # Run full Phase 2 analysis
+                phase2_result = engine.process_minute(
+                    iq_samples=samples,
+                    system_time=system_time,
+                    rtp_timestamp=start_rtp
+                )
+                
+                if phase2_result and phase2_result.d_clock_ms is not None:
+                    # Extract from nested result objects
+                    solution = phase2_result.solution
+                    time_snap = phase2_result.time_snap
+                    
+                    # Get SNR for the anchor station
+                    snr_db = 0.0
+                    if time_snap:
+                        station_lower = (solution.station if solution else 'WWV').lower()
+                        if station_lower == 'wwv' and time_snap.wwv_snr_db:
+                            snr_db = time_snap.wwv_snr_db
+                        elif station_lower == 'wwvh' and time_snap.wwvh_snr_db:
+                            snr_db = time_snap.wwvh_snr_db
+                        elif station_lower == 'chu' and time_snap.chu_snr_db:
+                            snr_db = time_snap.chu_snr_db
+                    
+                    result = {
+                        'station': solution.station if solution else 'UNKNOWN',
+                        'propagation_mode': solution.propagation_mode if solution else 'UNKNOWN',
+                        'propagation_delay_ms': solution.t_propagation_ms if solution else 0.0,
+                        'snr_db': snr_db,
+                        'confidence': phase2_result.confidence,
+                        'd_clock_ms': phase2_result.d_clock_ms
+                    }
+                    results[name] = result
+                    
+                    # Update channel state for next Fast Loop
+                    state = self.channel_states[name]
+                    state.station = result['station']
+                    state.propagation_mode = result['propagation_mode']
+                    state.propagation_delay_ms = result['propagation_delay_ms']
+                    state.snr_db = result['snr_db']
+                    state.confidence = result['confidence']
+                    state.last_update_minute = minute
+                    
+                    logger.info(f"  {name}: {result['station']} {result['propagation_mode']} "
+                               f"D_clock={result['d_clock_ms']:+.2f}ms")
+                else:
+                    logger.warning(f"  {name}: Phase 2 returned no result")
+                    
+            except Exception as e:
+                logger.warning(f"  {name}: Phase 2 processing failed: {e}")
             
             # Reset buffer for next minute
             buffer.reset_for_new_minute()
