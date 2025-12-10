@@ -767,9 +767,15 @@ Examples:
         # Get receiver config
         receiver_config = config.get('receiver', {})
         
+        # Get RTP config from file or CLI
+        rtp_config = config.get('rtp', {})
+        multicast_addr = rtp_config.get('multicast_address', args.multicast)
+        rtp_port = rtp_config.get('port', args.port)
+        status_addr = rtp_config.get('status_address', args.status_addr)
+        
         engine = LiveTimeEngine(
-            multicast_address=args.multicast,
-            port=args.port,
+            multicast_address=multicast_addr,
+            port=rtp_port,
             channels=channels,
             sample_rate=config.get('general', {}).get('sample_rate', 20000),
             receiver_grid=receiver_config.get('grid_square', 'EM38ww'),
@@ -777,7 +783,7 @@ Examples:
             receiver_lon=receiver_config.get('longitude'),
             enable_chrony=args.enable_chrony or config.get('output', {}).get('enable_chrony', False),
             chrony_unit=config.get('output', {}).get('chrony_unit', 0),
-            status_address=args.status_addr
+            status_address=status_addr
         )
         
         engine.run()

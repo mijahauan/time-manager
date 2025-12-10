@@ -625,7 +625,12 @@ class LiveTimeEngine:
             return []
     
     def _init_rtp_receiver(self):
-        """Initialize RTP receiver with callbacks for all channels."""
+        """
+        Initialize RTP receiver with callbacks for all channels.
+        
+        Key insight: We must use the multicast_address from discovered ChannelInfo,
+        NOT a hardcoded address. The discovered channels tell us WHERE the data is.
+        """
         # Import from grape_recorder core
         import sys
         sys.path.insert(0, str(Path.home() / 'grape-recorder' / 'src'))
@@ -644,7 +649,25 @@ class LiveTimeEngine:
             # Re-initialize buffers for discovered channels
             self._init_channel_buffers()
         
-        self.rtp_receiver = RTPReceiver(self.multicast_address, self.port)
+        # Get multicast address FROM THE DISCOVERED CHANNELS
+        # All channels on the same radiod stream share the same multicast address
+        actual_multicast = None
+        actual_port = self.port
+        
+        for ch_config in self.channels:
+            channel_info = ch_config.get('channel_info')
+            if channel_info:
+                actual_multicast = channel_info.multicast_address
+                actual_port = channel_info.port
+                logger.info(f"  Using multicast from discovered channels: {actual_multicast}:{actual_port}")
+                break
+        
+        if not actual_multicast:
+            # Fallback to configured address if no channel_info
+            actual_multicast = self.multicast_address
+            logger.warning(f"  No channel_info found, using configured multicast: {actual_multicast}:{actual_port}")
+        
+        self.rtp_receiver = RTPReceiver(actual_multicast, actual_port)
         
         # Register callback for each channel
         for ch_config in self.channels:

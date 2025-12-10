@@ -18,6 +18,12 @@ grid_square = "EM38ww"
 latitude = 38.918461
 longitude = -92.127974
 
+[rtp]
+# RTP multicast settings for live mode
+multicast_address = "239.103.26.231"  # bee1-hf-data.local
+port = 5004
+status_address = "bee1-hf-status.local"
+
 [output]
 # Output to development SHM (doesn't affect production)
 shm_path = "/dev/shm/grape_timing"
