@@ -1475,9 +1475,8 @@ class LiveTimeEngine:
             except Exception as e:
                 logger.error(f"Failed to initialize Chrony: {e}")
         
-        # Initialize and start RTP receiver
+        # Initialize RTP streams (RadiodStream instances are started inside)
         self._init_rtp_receiver()
-        self.rtp_receiver.start()
         
         # Start processing threads
         self.fast_loop_thread = threading.Thread(
