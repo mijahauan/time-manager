@@ -626,47 +626,101 @@ class LiveTimeEngine:
     
     def _init_rtp_receiver(self):
         """
-        Initialize RTP receiver with callbacks for all channels.
+        Initialize RTP receiver using ChannelManager pattern from grape-recorder.
         
-        Key insight: We must use the multicast_address from discovered ChannelInfo,
-        NOT a hardcoded address. The discovered channels tell us WHERE the data is.
+        This properly handles:
+        1. Discovering existing channels at our frequencies
+        2. Reusing channels if they match our destination
+        3. Creating new channels if needed
+        4. Getting the actual SSRCs to subscribe to
         """
-        # Import from grape_recorder core
         import sys
         sys.path.insert(0, str(Path.home() / 'grape-recorder' / 'src'))
         from grape_recorder.core.rtp_receiver import RTPReceiver
+        from grape_recorder.channel_manager import ChannelManager, generate_grape_multicast_ip
+        from ka9q import discover_channels
         
-        # If no channels configured, try to discover them
+        # Define our time signal frequencies
+        TIME_SIGNAL_FREQS = [
+            {'frequency_hz': 2500000, 'description': 'WWV 2.5 MHz'},
+            {'frequency_hz': 3330000, 'description': 'CHU 3.33 MHz'},
+            {'frequency_hz': 5000000, 'description': 'WWV 5 MHz'},
+            {'frequency_hz': 7850000, 'description': 'CHU 7.85 MHz'},
+            {'frequency_hz': 10000000, 'description': 'WWV 10 MHz'},
+            {'frequency_hz': 14670000, 'description': 'CHU 14.67 MHz'},
+            {'frequency_hz': 15000000, 'description': 'WWV 15 MHz'},
+            {'frequency_hz': 20000000, 'description': 'WWV 20 MHz'},
+            {'frequency_hz': 25000000, 'description': 'WWV 25 MHz'},
+        ]
+        
+        CHANNEL_DEFAULTS = {
+            'preset': 'iq',
+            'sample_rate': 20000,
+            'agc': 0,
+            'gain': 0.0,
+            'encoding': 'float'
+        }
+        
+        # Generate our destination multicast (same algorithm as grape-recorder)
+        # Use a different instrument_id to avoid conflict with grape-recorder
+        our_destination = generate_grape_multicast_ip('S000171', '173')  # time-manager
+        logger.info(f"  time-manager destination: {our_destination}")
+        
+        # Use ChannelManager to ensure channels exist
+        logger.info(f"  Ensuring {len(TIME_SIGNAL_FREQS)} channels via ChannelManager...")
+        channel_manager = ChannelManager(self.status_address)
+        
+        freq_to_ssrc = channel_manager.ensure_channels_from_config(
+            channels=TIME_SIGNAL_FREQS,
+            defaults=CHANNEL_DEFAULTS,
+            destination=our_destination
+        )
+        
+        if not freq_to_ssrc:
+            logger.error("No channels could be created/found")
+            raise RuntimeError("ChannelManager failed to ensure channels")
+        
+        logger.info(f"  Got {len(freq_to_ssrc)} channels from ChannelManager")
+        
+        # Discover channel info for timing (gps_time, rtp_timesnap)
+        discovered = discover_channels(self.status_address, listen_duration=2.0)
+        
+        # Build channel list with SSRCs from ChannelManager
+        self.channels = []
+        for ch_spec in TIME_SIGNAL_FREQS:
+            freq_hz = int(ch_spec['frequency_hz'])
+            if freq_hz not in freq_to_ssrc:
+                logger.warning(f"  {ch_spec['description']}: not allocated")
+                continue
+            
+            ssrc = freq_to_ssrc[freq_hz]
+            channel_info = discovered.get(ssrc)
+            
+            self.channels.append({
+                'name': ch_spec['description'],
+                'ssrc': ssrc,
+                'frequency_hz': freq_hz,
+                'channel_info': channel_info
+            })
+            logger.info(f"  {ch_spec['description']}: SSRC={ssrc}")
+        
         if not self.channels:
-            logger.info("No channels configured, discovering from radiod...")
-            self.channels = self._discover_channels(self.status_address)
-            
-            if not self.channels:
-                logger.error("No channels discovered - is radiod running?")
-                logger.error("Check: systemctl status radiod")
-                raise RuntimeError("No channels discovered from radiod")
-            
-            # Re-initialize buffers for discovered channels
-            self._init_channel_buffers()
+            raise RuntimeError("No channels allocated")
         
-        # Get multicast address FROM THE DISCOVERED CHANNELS
-        # All channels on the same radiod stream share the same multicast address
-        actual_multicast = None
+        # Re-initialize buffers for these channels
+        self._init_channel_buffers()
+        
+        # Get multicast address from the first channel's info
+        actual_multicast = our_destination
         actual_port = self.port
         
-        for ch_config in self.channels:
-            channel_info = ch_config.get('channel_info')
-            if channel_info:
-                actual_multicast = channel_info.multicast_address
-                actual_port = channel_info.port
-                logger.info(f"  Using multicast from discovered channels: {actual_multicast}:{actual_port}")
+        for ch in self.channels:
+            if ch.get('channel_info'):
+                actual_multicast = ch['channel_info'].multicast_address
+                actual_port = ch['channel_info'].port
                 break
         
-        if not actual_multicast:
-            # Fallback to configured address if no channel_info
-            actual_multicast = self.multicast_address
-            logger.warning(f"  No channel_info found, using configured multicast: {actual_multicast}:{actual_port}")
-        
+        logger.info(f"  RTP receiver on {actual_multicast}:{actual_port}")
         self.rtp_receiver = RTPReceiver(actual_multicast, actual_port)
         
         # Register callback for each channel
@@ -678,9 +732,9 @@ class LiveTimeEngine:
             self.rtp_receiver.register_callback(
                 ssrc=ssrc,
                 callback=self._rtp_callback(name),
-                channel_info=channel_info  # Enable wallclock timing
+                channel_info=channel_info
             )
-            logger.info(f"  Registered RTP callback: {name} (SSRC={ssrc})")
+            logger.info(f"  Registered: {name} (SSRC={ssrc})")
     
     def _fast_loop(self):
         """
