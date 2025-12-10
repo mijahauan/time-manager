@@ -562,6 +562,32 @@ class LiveTimeEngine:
         
         return callback
     
+    def _stream_callback(self, channel_name: str):
+        """
+        Create callback for RadiodStream.
+        
+        RadiodStream delivers (samples: np.ndarray, quality: StreamQuality).
+        We adapt this to add samples to our channel buffer.
+        """
+        def callback(samples: np.ndarray, quality):
+            if channel_name not in self.channel_buffers:
+                return
+            
+            # Get timing info from quality metrics
+            # RadiodStream provides continuous sample stream with quality tracking
+            current_time = time.time()
+            
+            # Use quality.total_samples as pseudo-RTP timestamp
+            # (RadiodStream handles resequencing internally)
+            rtp_timestamp = quality.total_samples if hasattr(quality, 'total_samples') else 0
+            
+            # Add to buffer
+            self.channel_buffers[channel_name].add_samples(
+                samples, rtp_timestamp, current_time
+            )
+        
+        return callback
+    
     def _discover_channels(self, status_address: str = "radiod.local") -> List[Dict[str, Any]]:
         """
         Discover available channels from radiod using ka9q.
@@ -626,19 +652,15 @@ class LiveTimeEngine:
     
     def _init_rtp_receiver(self):
         """
-        Initialize RTP receiver using ChannelManager pattern from grape-recorder.
+        Initialize RTP streams using ka9q-python directly.
         
-        This properly handles:
-        1. Discovering existing channels at our frequencies
-        2. Reusing channels if they match our destination
-        3. Creating new channels if needed
-        4. Getting the actual SSRCs to subscribe to
+        Uses RadiodStream for each channel - handles multicast, resequencing, gaps.
+        Uses RadiodControl to create/configure channels if needed.
         """
-        import sys
-        sys.path.insert(0, str(Path.home() / 'grape-recorder' / 'src'))
-        from grape_recorder.core.rtp_receiver import RTPReceiver
-        from grape_recorder.channel_manager import ChannelManager, generate_grape_multicast_ip
-        from ka9q import discover_channels
+        from ka9q import (
+            discover_channels, RadiodStream, RadiodControl, allocate_ssrc
+        )
+        import hashlib
         
         # Define our time signal frequencies
         TIME_SIGNAL_FREQS = [
@@ -658,83 +680,121 @@ class LiveTimeEngine:
             'sample_rate': 20000,
             'agc': 0,
             'gain': 0.0,
-            'encoding': 'float'
         }
         
-        # Generate our destination multicast (same algorithm as grape-recorder)
-        # Use a different instrument_id to avoid conflict with grape-recorder
-        our_destination = generate_grape_multicast_ip('S000171', '173')  # time-manager
+        # Generate our destination multicast (deterministic from station/instrument ID)
+        def generate_multicast_ip(station_id: str, instrument_id: str) -> str:
+            combined = f"{station_id}:{instrument_id}"
+            h = hashlib.md5(combined.encode()).digest()
+            return f"239.{h[0]}.{h[1]}.{h[2]}"
+        
+        our_destination = generate_multicast_ip('S000171', '173')  # time-manager
         logger.info(f"  time-manager destination: {our_destination}")
         
-        # Use ChannelManager to ensure channels exist
-        logger.info(f"  Ensuring {len(TIME_SIGNAL_FREQS)} channels via ChannelManager...")
-        channel_manager = ChannelManager(self.status_address)
-        
-        freq_to_ssrc = channel_manager.ensure_channels_from_config(
-            channels=TIME_SIGNAL_FREQS,
-            defaults=CHANNEL_DEFAULTS,
-            destination=our_destination
-        )
-        
-        if not freq_to_ssrc:
-            logger.error("No channels could be created/found")
-            raise RuntimeError("ChannelManager failed to ensure channels")
-        
-        logger.info(f"  Got {len(freq_to_ssrc)} channels from ChannelManager")
-        
-        # Discover channel info for timing (gps_time, rtp_timesnap)
+        # Discover existing channels
+        logger.info(f"  Discovering channels from {self.status_address}...")
         discovered = discover_channels(self.status_address, listen_duration=2.0)
         
-        # Build channel list with SSRCs from ChannelManager
+        # Build frequency -> ChannelInfo lookup
+        freq_to_channel = {}
+        for ssrc, ch_info in discovered.items():
+            freq_hz = int(round(ch_info.frequency))
+            freq_to_channel[freq_hz] = ch_info
+        
+        logger.info(f"  Found {len(discovered)} existing channels")
+        
+        # Get RadiodControl for creating/configuring channels
+        control = RadiodControl(self.status_address)
+        
+        # Ensure each time signal frequency has a channel
         self.channels = []
+        self._streams = []  # RadiodStream instances
+        
         for ch_spec in TIME_SIGNAL_FREQS:
             freq_hz = int(ch_spec['frequency_hz'])
-            if freq_hz not in freq_to_ssrc:
-                logger.warning(f"  {ch_spec['description']}: not allocated")
-                continue
+            name = ch_spec['description']
             
-            ssrc = freq_to_ssrc[freq_hz]
-            channel_info = discovered.get(ssrc)
+            if freq_hz in freq_to_channel:
+                ch_info = freq_to_channel[freq_hz]
+                
+                # Check if destination matches
+                if ch_info.multicast_address != our_destination:
+                    # Reconfigure to our destination
+                    logger.info(f"  ⚙ {name}: reconfiguring to {our_destination}")
+                    try:
+                        control.create_channel(
+                            frequency_hz=freq_hz,
+                            preset=CHANNEL_DEFAULTS['preset'],
+                            sample_rate=CHANNEL_DEFAULTS['sample_rate'],
+                            destination=our_destination,
+                            ssrc=ch_info.ssrc
+                        )
+                        # Re-discover to get updated info
+                        import time as time_mod
+                        time_mod.sleep(0.3)
+                        discovered = discover_channels(self.status_address, listen_duration=1.0)
+                        ch_info = discovered.get(ch_info.ssrc, ch_info)
+                    except Exception as e:
+                        logger.warning(f"  Failed to reconfigure {name}: {e}")
+                
+                logger.info(f"  ✓ {name}: SSRC={ch_info.ssrc}")
+            else:
+                # Create new channel
+                logger.info(f"  ➕ {name}: creating...")
+                try:
+                    ssrc = allocate_ssrc()
+                    control.create_channel(
+                        frequency_hz=freq_hz,
+                        preset=CHANNEL_DEFAULTS['preset'],
+                        sample_rate=CHANNEL_DEFAULTS['sample_rate'],
+                        destination=our_destination,
+                        ssrc=ssrc
+                    )
+                    import time as time_mod
+                    time_mod.sleep(0.3)
+                    discovered = discover_channels(self.status_address, listen_duration=1.0)
+                    ch_info = discovered.get(ssrc)
+                    if ch_info:
+                        logger.info(f"    Created SSRC={ssrc}")
+                    else:
+                        logger.warning(f"    Channel creation unverified")
+                        continue
+                except Exception as e:
+                    logger.error(f"    Failed to create {name}: {e}")
+                    continue
             
             self.channels.append({
-                'name': ch_spec['description'],
-                'ssrc': ssrc,
+                'name': name,
+                'ssrc': ch_info.ssrc,
                 'frequency_hz': freq_hz,
-                'channel_info': channel_info
+                'channel_info': ch_info
             })
-            logger.info(f"  {ch_spec['description']}: SSRC={ssrc}")
         
         if not self.channels:
-            raise RuntimeError("No channels allocated")
+            raise RuntimeError("No channels available")
+        
+        logger.info(f"  {len(self.channels)} channels ready")
         
         # Re-initialize buffers for these channels
         self._init_channel_buffers()
         
-        # Get multicast address from the first channel's info
-        actual_multicast = our_destination
-        actual_port = self.port
-        
-        for ch in self.channels:
-            if ch.get('channel_info'):
-                actual_multicast = ch['channel_info'].multicast_address
-                actual_port = ch['channel_info'].port
-                break
-        
-        logger.info(f"  RTP receiver on {actual_multicast}:{actual_port}")
-        self.rtp_receiver = RTPReceiver(actual_multicast, actual_port)
-        
-        # Register callback for each channel
+        # Create RadiodStream for each channel
         for ch_config in self.channels:
             name = ch_config['name']
-            ssrc = ch_config['ssrc']
-            channel_info = ch_config.get('channel_info')
+            ch_info = ch_config['channel_info']
             
-            self.rtp_receiver.register_callback(
-                ssrc=ssrc,
-                callback=self._rtp_callback(name),
-                channel_info=channel_info
+            # Create callback that adds samples to our buffer
+            callback = self._stream_callback(name)
+            
+            stream = RadiodStream(
+                channel=ch_info,
+                on_samples=callback,
+                samples_per_packet=400,  # 20ms at 20kHz
+                deliver_interval_packets=1  # Deliver every packet
             )
-            logger.info(f"  Registered: {name} (SSRC={ssrc})")
+            stream.start()
+            self._streams.append(stream)
+            logger.info(f"  Started stream: {name} (SSRC={ch_info.ssrc})")
     
     def _fast_loop(self):
         """
@@ -1444,8 +1504,16 @@ class LiveTimeEngine:
         logger.info("Stopping LiveTimeEngine...")
         self.running = False
         
-        # Stop RTP receiver
-        if self.rtp_receiver:
+        # Stop RadiodStream instances
+        if hasattr(self, '_streams'):
+            for stream in self._streams:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+        
+        # Legacy: stop old-style RTP receiver if present
+        if hasattr(self, 'rtp_receiver') and self.rtp_receiver:
             self.rtp_receiver.stop()
         
         # Wait for threads
