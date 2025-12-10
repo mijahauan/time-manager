@@ -356,6 +356,19 @@ class LiveTimeEngine:
         # Last fusion result
         self.last_fusion: Optional[FusionResult] = None
         
+        # TransmissionTimeSolver for computing per-station propagation delays
+        self._propagation_solver = None
+        if self.receiver_lat is not None and self.receiver_lon is not None:
+            try:
+                from ..timing.transmission_time_solver import TransmissionTimeSolver
+                self._propagation_solver = TransmissionTimeSolver(
+                    receiver_lat=self.receiver_lat,
+                    receiver_lon=self.receiver_lon,
+                    sample_rate=sample_rate
+                )
+            except Exception as e:
+                logger.warning(f"Could not initialize propagation solver: {e}")
+        
         logger.info("=" * 60)
         logger.info("LiveTimeEngine initializing")
         logger.info(f"  Multicast: {multicast_address}:{port}")
@@ -568,20 +581,30 @@ class LiveTimeEngine:
         
         RadiodStream delivers (samples: np.ndarray, quality: StreamQuality).
         We adapt this to add samples to our channel buffer.
+        
+        Critical: We must use actual RTP timestamps from radiod, not sample counts.
+        RTP timestamps are GPS-disciplined and essential for sub-ms timing.
         """
         def callback(samples: np.ndarray, quality):
             if channel_name not in self.channel_buffers:
                 return
             
-            # Get timing info from quality metrics
-            # RadiodStream provides continuous sample stream with quality tracking
             current_time = time.time()
             
-            # Use quality.total_samples as pseudo-RTP timestamp
-            # (RadiodStream handles resequencing internally)
-            rtp_timestamp = quality.total_samples if hasattr(quality, 'total_samples') else 0
+            # Calculate RTP timestamp for this batch from StreamQuality
+            # first_rtp_timestamp + batch_start_sample gives us the actual RTP timestamp
+            # for the start of this sample batch (GPS-disciplined from radiod)
+            if hasattr(quality, 'first_rtp_timestamp') and hasattr(quality, 'batch_start_sample'):
+                rtp_timestamp = quality.first_rtp_timestamp + quality.batch_start_sample
+            elif hasattr(quality, 'last_rtp_timestamp'):
+                # Fallback: use last_rtp_timestamp - len(samples) 
+                rtp_timestamp = quality.last_rtp_timestamp - len(samples)
+            else:
+                # Last resort: use sample count (breaks timing accuracy)
+                rtp_timestamp = getattr(quality, 'total_samples_delivered', 0)
+                logger.warning(f"{channel_name}: No RTP timestamp in StreamQuality, using sample count")
             
-            # Add to buffer
+            # Add to buffer with proper RTP timestamp
             self.channel_buffers[channel_name].add_samples(
                 samples, rtp_timestamp, current_time
             )
@@ -1133,6 +1156,11 @@ class LiveTimeEngine:
             )
             
             self._publish_shm(solution)
+            
+            # Update Chrony if enabled
+            if self.enable_chrony and self.chrony_shm:
+                self._update_chrony()
+            
             self._save_state()
     
     def _extract_all_broadcasts(self, freq_name: str, phase2_result, solution, time_snap) -> Dict[str, Dict]:
@@ -1165,20 +1193,32 @@ class LiveTimeEngine:
         CHU_FREQS = {3.33, 7.85, 14.67}
         is_chu = freq_mhz in CHU_FREQS
         
-        # Base propagation delay from the dominant solution
-        base_prop_delay = solution.t_propagation_ms if solution else 0.0
+        # Get propagation mode from dominant solution
         prop_mode = solution.propagation_mode if solution else '2F'
+        
+        # Helper to get proper per-station propagation delay
+        def get_station_delay(station: str) -> float:
+            """Get propagation delay for specific station using proper geometry."""
+            if self._propagation_solver:
+                return self._propagation_solver.get_station_propagation_delay(
+                    station=station,
+                    frequency_mhz=freq_mhz,
+                    mode=prop_mode
+                )
+            else:
+                # Fallback to dominant solution delay (less accurate)
+                return solution.t_propagation_ms if solution else 0.0
         
         # Extract WWV timing if detected
         if time_snap and time_snap.wwv_detected and time_snap.wwv_timing_ms is not None:
             wwv_key = f"WWV {freq_mhz} MHz"
-            # D_clock = arrival_time - propagation_delay
-            # timing_ms is offset from minute boundary
-            wwv_d_clock = time_snap.wwv_timing_ms - base_prop_delay
+            wwv_prop_delay = get_station_delay('WWV')
+            # D_clock = arrival_time - propagation_delay (back-calculate to UTC(NIST))
+            wwv_d_clock = time_snap.wwv_timing_ms - wwv_prop_delay
             broadcasts[wwv_key] = {
                 'station': 'WWV',
                 'propagation_mode': prop_mode,
-                'propagation_delay_ms': base_prop_delay,
+                'propagation_delay_ms': wwv_prop_delay,
                 'snr_db': time_snap.wwv_snr_db or 0.0,
                 'confidence': phase2_result.confidence if time_snap.wwv_snr_db and time_snap.wwv_snr_db > 3 else 0.1,
                 'd_clock_ms': wwv_d_clock,
@@ -1188,9 +1228,8 @@ class LiveTimeEngine:
         # Extract WWVH timing if detected (only on shared frequencies)
         if is_shared and time_snap and time_snap.wwvh_detected and time_snap.wwvh_timing_ms is not None:
             wwvh_key = f"WWVH {freq_mhz} MHz"
-            # WWVH has different propagation path - use scaled delay
-            # WWVH is ~6600km from receiver vs ~1100km for WWV (roughly 6x)
-            wwvh_prop_delay = base_prop_delay * 2.5  # Approximate scaling
+            wwvh_prop_delay = get_station_delay('WWVH')
+            # D_clock = arrival_time - propagation_delay (back-calculate to UTC(NIST))
             wwvh_d_clock = time_snap.wwvh_timing_ms - wwvh_prop_delay
             broadcasts[wwvh_key] = {
                 'station': 'WWVH',
@@ -1205,11 +1244,13 @@ class LiveTimeEngine:
         # Extract CHU timing if detected
         if is_chu and time_snap and time_snap.chu_detected and time_snap.chu_timing_ms is not None:
             chu_key = f"CHU {freq_mhz} MHz"
-            chu_d_clock = time_snap.chu_timing_ms - base_prop_delay
+            chu_prop_delay = get_station_delay('CHU')
+            # D_clock = arrival_time - propagation_delay (back-calculate to UTC(NRC))
+            chu_d_clock = time_snap.chu_timing_ms - chu_prop_delay
             broadcasts[chu_key] = {
                 'station': 'CHU',
                 'propagation_mode': prop_mode,
-                'propagation_delay_ms': base_prop_delay,
+                'propagation_delay_ms': chu_prop_delay,
                 'snr_db': time_snap.chu_snr_db or 0.0,
                 'confidence': phase2_result.confidence if time_snap.chu_snr_db and time_snap.chu_snr_db > 3 else 0.1,
                 'd_clock_ms': chu_d_clock,
@@ -1218,10 +1259,12 @@ class LiveTimeEngine:
         
         # Fallback: if no broadcasts extracted, use the dominant solution
         if not broadcasts:
+            fallback_station = solution.station if solution else 'WWV'
+            fallback_delay = get_station_delay(fallback_station)
             broadcasts[freq_name] = {
-                'station': solution.station if solution else 'UNKNOWN',
+                'station': fallback_station,
                 'propagation_mode': prop_mode,
-                'propagation_delay_ms': base_prop_delay,
+                'propagation_delay_ms': fallback_delay,
                 'snr_db': 0.0,
                 'confidence': phase2_result.confidence,
                 'd_clock_ms': phase2_result.d_clock_ms
@@ -1435,16 +1478,29 @@ class LiveTimeEngine:
             self._save_calibration()
     
     def _update_chrony(self):
-        """Update Chrony SHM with current D_clock."""
+        """Update Chrony SHM with current D_clock.
+        
+        D_clock = system_time - reference_time (positive if system is fast)
+        We pass: reference_time = system_time - D_clock
+        
+        The chrony_shm.update() method expects:
+        - reference_time: The "true" time according to WWV/CHU
+        - system_time: When the measurement was taken
+        """
         if not self.chrony_shm:
+            logger.warning("Chrony SHM not connected")
             return
         
         try:
-            # Convert D_clock (ms) to offset (seconds)
-            offset = self.d_clock_ms / 1000.0
-            self.chrony_shm.update(offset, time.time())
+            now = time.time()
+            # D_clock is how much system clock is ahead of UTC (in ms)
+            # reference_time is what WWV says the time is
+            offset_sec = self.d_clock_ms / 1000.0
+            reference_time = now - offset_sec
+            
+            self.chrony_shm.update(reference_time, now, precision=-10)
             self.stats['chrony_updates'] += 1
-            logger.debug(f"Chrony updated: offset={offset*1000:.2f}ms")
+            logger.info(f"  Chrony updated: D_clock={self.d_clock_ms:+.2f}ms (update #{self.stats['chrony_updates']})")
         except Exception as e:
             logger.error(f"Chrony update failed: {e}")
     

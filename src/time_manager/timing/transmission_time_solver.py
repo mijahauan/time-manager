@@ -466,6 +466,68 @@ class TransmissionTimeSolver:
         
         return EARTH_RADIUS_KM * c
     
+    def get_station_propagation_delay(
+        self,
+        station: str,
+        frequency_mhz: float,
+        mode: str = '2F',
+        timestamp: Optional[datetime] = None
+    ) -> float:
+        """
+        Calculate propagation delay for a specific station and mode.
+        
+        This is a simplified interface for getting the expected propagation
+        delay without running full mode disambiguation.
+        
+        Args:
+            station: 'WWV', 'WWVH', or 'CHU'
+            frequency_mhz: Carrier frequency in MHz
+            mode: Propagation mode string ('1F', '2F', '3F', '1E', 'GW')
+            timestamp: UTC datetime for dynamic ionosphere (optional)
+            
+        Returns:
+            Propagation delay in milliseconds
+        """
+        if station not in self.station_distances:
+            logger.warning(f"Unknown station {station}, using 0 delay")
+            return 0.0
+        
+        ground_distance = self.station_distances[station]
+        
+        # Get station coordinates for ionospheric midpoint
+        station_info = STATIONS.get(station, {})
+        station_lat = station_info.get('lat')
+        station_lon = station_info.get('lon')
+        
+        # Map mode string to PropagationMode enum
+        mode_map = {
+            'GW': PropagationMode.GROUND_WAVE,
+            '1E': PropagationMode.ONE_HOP_E,
+            '1F': PropagationMode.ONE_HOP_F,
+            '2F': PropagationMode.TWO_HOP_F,
+            '3F': PropagationMode.THREE_HOP_F,
+        }
+        prop_mode = mode_map.get(mode.upper(), PropagationMode.TWO_HOP_F)
+        
+        # Calculate delay using existing method
+        candidate = self._calculate_mode_delay(
+            prop_mode,
+            ground_distance,
+            frequency_mhz,
+            timestamp=timestamp,
+            station_lat=station_lat,
+            station_lon=station_lon
+        )
+        
+        if candidate:
+            return candidate.total_delay_ms
+        else:
+            # Fallback: simple distance/speed calculation
+            path_km = ground_distance * 1.1  # Approximate ionospheric path
+            delay_ms = (path_km / SPEED_OF_LIGHT_KM_S) * 1000
+            logger.debug(f"Mode {mode} not valid for {station}, using fallback: {delay_ms:.2f}ms")
+            return delay_ms
+    
     def _calculate_hop_path(
         self,
         ground_distance_km: float,

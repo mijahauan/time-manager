@@ -37,3 +37,12 @@ logs/
 
 # Local config
 config/local*.toml
+
+# IRI data files (large, site-specific)
+*.dat
+
+# Shared memory files
+/dev/shm/
+
+# State files
+/var/lib/grape-recorder/

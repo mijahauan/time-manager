@@ -1,55 +1,41 @@
 """
 Chrony Shared Memory (SHM) Refclock Driver
 
-This module implements the NTP SHM refclock protocol used by chronyd
-to discipline the system clock from external time sources.
-
-When time-manager achieves lock on WWV/WWVH/CHU time signals, it can
-feed chronyd via this interface, making the entire Linux system clock
-accurate to ±1ms - any application gets "GPS-quality" timestamps.
+This module writes timing data to a System V Shared Memory segment 
+compatible with Chrony's 'refclock SHM' driver.
 
 Chronyd Configuration:
 ----------------------
 Add to /etc/chrony/chrony.conf:
 
     # HF Time Transfer via time-manager
-    refclock SHM 0 refid HF poll 3 precision 1e-3 offset 0.0
+    refclock SHM 0 refid TMGR poll 6 precision 1e-4 offset 0.0 delay 0.2
     
-    # Options:
-    #   SHM 0     - Shared memory unit 0 (shmid = 0x4e545030)
-    #   refid HF  - Reference ID shown in chronyc sources
-    #   poll 3    - Poll interval 2^3 = 8 seconds (we update every minute)
-    #   precision - 1ms precision
-    #   offset    - Calibration offset (adjust if needed)
+Restart: sudo systemctl restart chronyd
 
-SHM Protocol:
-------------
-The SHM segment has a fixed structure (from ntpd/chronyd documentation):
+Structure Layout (struct shmTime on 64-bit Linux):
+-------------------------------------------------
+    int    mode;                 // 0-3   (Mode 1 = use count locking)
+    int    count;                // 4-7   (Sequence counter)
+    time_t clockTimeStampSec;    // 8-15  (System time seconds)
+    int    clockTimeStampUSec;   // 16-19 (System time microseconds)
+    [pad]                        // 20-23 (Alignment padding)
+    time_t receiveTimeStampSec;  // 24-31 (Reference time seconds)
+    int    receiveTimeStampUSec; // 32-35 (Reference time microseconds)
+    [pad]                        // 36-39 (Alignment padding)
+    int    leap;                 // 40-43 (Leap second indicator)
+    int    precision;            // 44-47 (log2 precision)
+    int    nsamples;             // 48-51 (Number of samples)
+    int    valid;                // 52-55 (Data is valid)
 
-    struct shmTime {
-        int    mode;           // 0 = not valid, 1 = valid
-        int    count;          // Sequence counter
-        time_t clockTimeStampSec;   // Reference time (UTC from WWV)
-        int    clockTimeStampUSec;
-        time_t receiveTimeStampSec; // System time when sample taken
-        int    receiveTimeStampUSec;
-        int    leap;           // Leap second indicator
-        int    precision;      // log2(precision in seconds)
-        int    nsamples;       // Number of samples
-        int    valid;          // Data is valid
-        int    clockTimeStampNSec;  // Nanosecond extension
-        int    receiveTimeStampNSec;
-        int    dummy[8];       // Reserved
-    };
+NOTE: Chrony creates the SHM segment. We attach to it.
+      If running as non-root, ensure permissions allow access.
 
 Reference:
 - https://chrony.tuxfamily.org/doc/4.0/chrony.conf.html#refclock
-- https://www.ntp.org/documentation/drivers/driver28/
 """
 
-import ctypes
 import logging
-import mmap
 import os
 import struct
 import time
@@ -202,47 +188,55 @@ class ChronySHM:
             # Increment sequence counter
             self.count += 1
             
-            # Split timestamps into seconds and microseconds/nanoseconds
-            ref_sec = int(reference_time)
-            ref_usec = int((reference_time - ref_sec) * 1_000_000)
-            ref_nsec = int((reference_time - ref_sec) * 1_000_000_000)
+            # Split timestamps into seconds and microseconds
+            # NOTE: clockTimeStamp = system time, receiveTimeStamp = reference time
+            # This matches what chrony expects for offset calculation
+            clock_sec = int(system_time)
+            clock_usec = int((system_time - clock_sec) * 1_000_000)
             
-            sys_sec = int(system_time)
-            sys_usec = int((system_time - sys_sec) * 1_000_000)
-            sys_nsec = int((system_time - sys_sec) * 1_000_000_000)
+            recv_sec = int(reference_time)
+            recv_usec = int((reference_time - recv_sec) * 1_000_000)
             
-            # Pack the SHM structure
-            # struct shmTime (96 bytes):
-            #   int mode (4)
-            #   int count (4)
-            #   time_t clockTimeStampSec (8 on 64-bit)
-            #   int clockTimeStampUSec (4)
-            #   time_t receiveTimeStampSec (8)
-            #   int receiveTimeStampUSec (4)
-            #   int leap (4)
-            #   int precision (4)
-            #   int nsamples (4)
-            #   int valid (4)
-            #   int clockTimeStampNSec (4)
-            #   int receiveTimeStampNSec (4)
-            #   int dummy[8] (32)
+            # Nanoseconds for extended precision
+            clock_nsec = int((system_time - clock_sec) * 1_000_000_000) % 1_000_000_000
+            recv_nsec = int((reference_time - recv_sec) * 1_000_000_000) % 1_000_000_000
             
-            # Note: The exact struct layout varies by platform.
-            # This is the common 64-bit Linux layout.
+            # Pack the SHM structure for 64-bit Linux (96 bytes total)
+            # Format: @iiqiiqiiiiii8i with proper alignment
+            # 
+            # Layout (with native alignment):
+            #   0-3:   int mode
+            #   4-7:   int count
+            #   8-15:  time_t clockTimeStampSec (64-bit)
+            #   16-19: int clockTimeStampUSec
+            #   20-23: (padding for 8-byte alignment)
+            #   24-31: time_t receiveTimeStampSec (64-bit)
+            #   32-35: int receiveTimeStampUSec
+            #   36-39: (padding for 8-byte alignment)  
+            #   40-43: int leap
+            #   44-47: int precision
+            #   48-51: int nsamples
+            #   52-55: int valid
+            #   56-59: unsigned clockTimeStampNSec
+            #   60-63: unsigned receiveTimeStampNSec
+            #   64-95: int dummy[8]
+            
             data = struct.pack(
-                '=ii q i q i iiii ii 8i',
-                1,              # mode = 1 (valid)
-                self.count,     # count
-                ref_sec,        # clockTimeStampSec
-                ref_usec,       # clockTimeStampUSec
-                sys_sec,        # receiveTimeStampSec
-                sys_usec,       # receiveTimeStampUSec
+                '@ii q i xxxx q i xxxx iiii II 8i',
+                1,              # mode = 1 (use count locking)
+                self.count,     # count (sequence number)
+                clock_sec,      # clockTimeStampSec (system time)
+                clock_usec,     # clockTimeStampUSec
+                # xxxx padding
+                recv_sec,       # receiveTimeStampSec (reference/true time)
+                recv_usec,      # receiveTimeStampUSec
+                # xxxx padding
                 leap,           # leap
                 precision,      # precision
                 1,              # nsamples
                 1,              # valid
-                ref_nsec,       # clockTimeStampNSec
-                sys_nsec,       # receiveTimeStampNSec
+                clock_nsec,     # clockTimeStampNSec
+                recv_nsec,      # receiveTimeStampNSec
                 0, 0, 0, 0, 0, 0, 0, 0  # dummy[8]
             )
             

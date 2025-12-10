@@ -28,8 +28,8 @@ status_address = "bee1-hf-status.local"
 # Output to development SHM (doesn't affect production)
 shm_path = "/dev/shm/grape_timing"
 
-# Chrony disabled for development - don't touch system clock
-enable_chrony = false
+# Enable Chrony SHM refclock (TMGR in chronyc sources)
+enable_chrony = true
 chrony_unit = 0
 
 [channels]

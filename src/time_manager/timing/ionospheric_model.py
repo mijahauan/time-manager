@@ -238,26 +238,41 @@ class IonosphericModel:
             self._check_iri_availability()
     
     def _check_iri_availability(self) -> bool:
-        """Check if IRI-2016 Python package is available and functional."""
+        """Check if IRI Python package is available and functional.
+        
+        Tries IRI2020 first (preferred), then falls back to IRI2016.
+        """
         if self._iri_available is not None:
             return self._iri_available
         
+        # Try IRI2020 first (preferred, more accurate)
+        try:
+            import iri2020
+            self._iri_module = iri2020
+            self._iri_available = True
+            logger.info("IRI-2020 model available and functional")
+            return True
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"IRI-2020 failed: {e}")
+        
+        # Fall back to IRI2016
         try:
             import iri2016
-            # Quick test to verify it works
-            # This will compile Fortran on first run if needed
             self._iri_module = iri2016
             self._iri_available = True
             logger.info("IRI-2016 model available and functional")
+            return True
         except ImportError:
             self._iri_available = False
             logger.warning(
-                "IRI-2016 not available (pip install iri2016 + gfortran required). "
+                "No IRI model available (pip install iri2020 or iri2016 + gfortran required). "
                 "Using parametric fallback model."
             )
         except Exception as e:
             self._iri_available = False
-            logger.warning(f"IRI-2016 initialization failed: {e}. Using parametric fallback.")
+            logger.warning(f"IRI initialization failed: {e}. Using parametric fallback.")
         
         return self._iri_available
     

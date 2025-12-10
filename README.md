@@ -4,6 +4,17 @@
 
 A standalone timing service that extracts UTC(NIST) from WWV/WWVH/CHU standard time broadcasts. It abstracts the ionospheric channel, providing clean D_clock and Station_ID to any consuming application.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+## What's New in v0.2.0
+
+- **Per-station propagation delays**: Proper UTC(NIST) back-calculation using correct transmitter coordinates for WWV, WWVH, and CHU
+- **IRI2020 ionospheric model**: Dynamic F2-layer heights for accurate propagation delay estimation
+- **Chrony SHM integration**: Discipline system clock to sub-millisecond accuracy
+- **GPS-disciplined RTP timestamps**: Uses actual ka9q-radio timestamps for sub-ms precision
+
+See [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Overview
 
 time-manager is **infrastructure**, not a science application. Just as `radiod` abstracts the SDR hardware, time-manager abstracts the Ionospheric Channel. It provides:
@@ -150,8 +161,13 @@ Add to `/etc/chrony/chrony.conf`:
 
 ```
 # HF Time Transfer via time-manager
-refclock SHM 0 refid HF poll 3 precision 1e-3 offset 0.0
+refclock SHM 0 refid TMGR poll 6 precision 1e-4 offset 0.0 delay 0.2
 ```
+
+Parameters:
+- `poll 6`: Check every 64 seconds (2^6)
+- `precision 1e-4`: 0.1ms precision estimate
+- `delay 0.2`: Account for ~200ms ionospheric variation
 
 Then restart chronyd:
 
@@ -197,14 +213,23 @@ The shared memory file contains JSON:
 
 ## Related Projects
 
-- **grape-recorder**: Science data recorder that consumes timing from time-manager
-- **ka9q-radio**: SDR server providing RTP streams
+- **[grape-recorder](https://github.com/mijahauan/grape-recorder)**: Science data recorder that consumes timing from time-manager
+- **[ka9q-radio](https://github.com/ka9q/ka9q-radio)**: SDR server providing RTP streams
 - **chronyd**: System clock discipline
+
+## Documentation
+
+- [CHANGELOG.md](CHANGELOG.md) - Version history and release notes
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Technical architecture and design
 
 ## License
 
-MIT License - See LICENSE file
+MIT License - See [LICENSE](LICENSE) file
 
 ## Author
 
 Michael James Hauan (AC0G)
+
+## Repository
+
+https://github.com/mijahauan/time-manager
