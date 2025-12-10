@@ -317,6 +317,11 @@ class LiveTimeEngine:
         self.d_clock_uncertainty_ms = 10.0
         self.clock_drift_ppm = 0.0
         
+        # RTP-to-System offset smoothing (eliminates host jitter)
+        # This is the key to using GPSDO as a "steel ruler"
+        self.rtp_system_offset: Dict[str, float] = {}  # Per-channel smoothed offset
+        self.rtp_offset_alpha = 0.05  # EMA smoothing factor (slow adaptation)
+        
         # RTP receiver (will be initialized on start)
         self.rtp_receiver = None
         
@@ -526,8 +531,29 @@ class LiveTimeEngine:
             # Convert payload to complex64 samples
             samples = np.frombuffer(payload, dtype=np.complex64)
             
-            # Use wallclock or estimate from RTP
-            wc = wallclock or (header.timestamp / self.sample_rate)
+            # FIX Issue 2: Safe wallclock handling
+            # Never estimate absolute time from raw RTP without a known anchor
+            if wallclock is None:
+                # Use current system time as fallback (introduces jitter but is safe)
+                wc = time.time()
+            else:
+                wc = wallclock
+                
+                # FIX Issue 1: Update smoothed RTP-to-System offset
+                # This filters out USB latency, kernel scheduling, and GC pauses
+                rtp_time = header.timestamp / self.sample_rate
+                instant_offset = wc - rtp_time
+                
+                if channel_name in self.rtp_system_offset:
+                    # EMA smoothing: slow adaptation preserves GPSDO "steel ruler"
+                    old_offset = self.rtp_system_offset[channel_name]
+                    self.rtp_system_offset[channel_name] = (
+                        (1 - self.rtp_offset_alpha) * old_offset + 
+                        self.rtp_offset_alpha * instant_offset
+                    )
+                else:
+                    # Initialize with first observation
+                    self.rtp_system_offset[channel_name] = instant_offset
             
             # Add to buffer
             self.channel_buffers[channel_name].add_samples(
@@ -727,10 +753,14 @@ class LiveTimeEngine:
                 
                 detector = self._tone_detectors[name]
                 
-                # Calculate buffer start time from RTP
-                # buffer_start_time = start_rtp / self.sample_rate (if GPSDO-locked)
-                # For now, use wallclock estimate
-                buffer_start_time = buffer.last_wallclock - (len(samples) / self.sample_rate)
+                # FIX Issue 1: Use smoothed RTP-to-System offset (eliminates host jitter)
+                # This is the key to microsecond precision with GPSDO
+                if name in self.rtp_system_offset:
+                    # Use the "steel ruler": RTP time + smoothed offset
+                    buffer_start_time = (start_rtp / self.sample_rate) + self.rtp_system_offset[name]
+                else:
+                    # Fallback to raw wallclock (jittery but safe)
+                    buffer_start_time = buffer.last_wallclock - (len(samples) / self.sample_rate)
                 
                 # Run tone detection with narrow window (Fast Loop uses previous state)
                 detections = detector.process_samples(
@@ -743,15 +773,25 @@ class LiveTimeEngine:
                 )
                 
                 if detections:
-                    # Use primary detection (highest priority station)
-                    primary = max(detections, key=lambda d: d.snr_db if d.snr_db else 0)
+                    # FIX Issue 3: Filter detections to match channel's current state
+                    # Prevents "split brain" where we detect Hawaii but subtract Colorado delay
+                    matching_detection = None
+                    for d in detections:
+                        detection_station = d.station.value if hasattr(d.station, 'value') else str(d.station)
+                        if detection_station.upper() == state.station.upper():
+                            if matching_detection is None or (d.snr_db or 0) > (matching_detection.snr_db or 0):
+                                matching_detection = d
                     
-                    # D_clock = T_arrival - T_propagation
-                    # timing_error_ms is offset from expected minute boundary
-                    d_clock = primary.timing_error_ms - state.propagation_delay_ms
-                    
-                    d_clock_values.append((d_clock, state.confidence, primary.snr_db or 1.0))
-                    logger.info(f"  {name}: D_clock={d_clock:+.2f}ms, SNR={primary.snr_db:.1f}dB")
+                    if matching_detection:
+                        # D_clock = T_arrival - T_propagation
+                        # timing_error_ms is offset from expected minute boundary
+                        d_clock = matching_detection.timing_error_ms - state.propagation_delay_ms
+                        d_clock_values.append((d_clock, state.confidence, matching_detection.snr_db or 1.0))
+                        logger.info(f"  {name}: D_clock={d_clock:+.2f}ms, SNR={matching_detection.snr_db:.1f}dB")
+                    else:
+                        # Station mismatch - don't mix delays!
+                        detected_stations = [d.station.value if hasattr(d.station, 'value') else str(d.station) for d in detections]
+                        logger.warning(f"  {name}: Station mismatch - expected {state.station}, detected {detected_stations}")
                 else:
                     logger.debug(f"  {name}: No tone detected")
                     
