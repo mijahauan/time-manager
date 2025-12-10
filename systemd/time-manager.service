@@ -1,0 +1,39 @@
+[Unit]
+Description=time-manager - Precision HF Time Transfer Daemon
+Documentation=https://github.com/AC0G/time-manager
+After=network.target radiod.service
+Wants=radiod.service
+
+[Service]
+Type=simple
+User=wsprdaemon
+Group=wsprdaemon
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/time-manager/environment
+
+# Working directory and executable
+WorkingDirectory=/home/wsprdaemon/time-manager
+ExecStart=/home/wsprdaemon/time-manager/venv/bin/python -m time_manager --config /etc/time-manager/config.toml
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Resource limits
+Nice=-5
+LimitMEMLOCK=infinity
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=time-manager
+
+# Security (relaxed for SHM access)
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

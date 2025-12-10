@@ -1,0 +1,101 @@
+# time-manager configuration
+#
+# Precision HF Time Transfer Daemon
+# Extracts UTC(NIST) from WWV/WWVH/CHU broadcasts
+
+[general]
+# Data root directory (where raw_buffer and phase2 data live)
+data_root = "/tmp/grape-test"
+
+# Sample rate of IQ data from radiod (Hz)
+sample_rate = 20000
+
+# Poll interval for checking new data (seconds)
+poll_interval = 10.0
+
+# Minimum channels required for lock
+min_channels_for_lock = 3
+
+# Maximum acceptable uncertainty for LOCKED status (ms)
+max_uncertainty_for_lock = 2.0
+
+[receiver]
+# Maidenhead grid square (6 or 10 character)
+grid_square = "EM38ww"
+
+# Precise coordinates (optional, improves timing by ~16μs)
+# If not provided, grid square center is used
+latitude = 38.918461
+longitude = -92.127974
+
+[output]
+# Shared memory file for consumer applications
+shm_path = "/dev/shm/grape_timing"
+
+# Chrony SHM integration
+enable_chrony = false
+chrony_unit = 0  # Corresponds to "refclock SHM 0" in chrony.conf
+
+# ZeroMQ publisher (future)
+# enable_zmq = false
+# zmq_endpoint = "tcp://*:5555"
+
+[channels]
+# Channels to process
+# WWV: 2.5, 5, 10, 15, 20, 25 MHz
+# WWVH: 2.5, 5, 10, 15 MHz (shared with WWV, requires discrimination)
+# CHU: 3.33, 7.85, 14.67 MHz
+enabled = [
+    "WWV 2.5 MHz",
+    "WWV 5 MHz", 
+    "WWV 10 MHz",
+    "WWV 15 MHz",
+    "WWV 20 MHz",
+    "WWV 25 MHz",
+    "CHU 3.33 MHz",
+    "CHU 7.85 MHz",
+    "CHU 14.67 MHz"
+]
+
+[fusion]
+# Multi-broadcast fusion parameters
+
+# Minimum SNR to include channel in fusion (dB)
+min_snr_for_fusion = 6.0
+
+# Maximum uncertainty to include channel in fusion (ms)
+max_uncertainty_for_fusion = 20.0
+
+# Outlier rejection threshold (sigma)
+outlier_sigma = 3.0
+
+# Per-station calibration offsets (ms)
+# These compensate for systematic biases per station
+wwv_calibration_offset = 0.0
+wwvh_calibration_offset = 0.0
+chu_calibration_offset = 0.0
+
+[convergence]
+# Clock convergence model parameters ("Set, Monitor, Intervention")
+
+# Uncertainty threshold for declaring LOCKED (ms)
+lock_uncertainty_ms = 1.0
+
+# Minimum samples before declaring lock
+min_samples_for_lock = 30
+
+# Anomaly detection threshold (sigma)
+anomaly_sigma = 3.0
+
+# Force reacquisition after this many consecutive anomalies
+max_consecutive_anomalies = 5
+
+[logging]
+# Log level: DEBUG, INFO, WARNING, ERROR
+level = "INFO"
+
+# Log format
+format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# Log file (empty = stdout only)
+# file = "/var/log/time-manager/time-manager.log"

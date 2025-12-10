@@ -1,0 +1,18 @@
+# time-manager requirements
+
+# Core dependencies
+numpy>=1.20.0
+scipy>=1.7.0
+toml>=0.10.0
+
+# Optional: Chrony SHM integration
+# Uncomment if using Chrony refclock
+# sysv_ipc>=1.1.0
+
+# Optional: ZeroMQ publisher
+# Uncomment if using ZMQ output
+# pyzmq>=22.0.0
+
+# Development dependencies (install with: pip install -e ".[dev]")
+# pytest>=7.0.0
+# pytest-cov>=3.0.0
