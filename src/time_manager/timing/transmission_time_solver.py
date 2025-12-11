@@ -101,8 +101,8 @@ Total path length:
 Geometric delay:
     τ_geo = path_length / c
 
-Note: This is a flat-Earth approximation, valid for paths < 2000 km.
-For longer paths, Earth curvature must be considered.
+Note: For paths < 500 km, flat-Earth approximation is used for efficiency.
+For longer paths, spherical Earth geometry is applied (2025-12-10 fix).
 
 REFERENCE: McNamara, L.F. (1991). "The Ionosphere: Communications,
            Surveillance, and Direction Finding." Krieger Publishing.
@@ -300,24 +300,31 @@ from .wwv_constants import STATION_LOCATIONS as STATIONS
 # The ionosphere is a dispersive medium: group velocity depends on frequency.
 # Lower frequencies experience more delay (slower group velocity).
 #
-# Physical basis: v_group = c × √(1 - (f_p/f)²)
-# Where f_p = plasma frequency (~3-12 MHz in F-layer)
+# Physical basis: τ_iono = 40.3 × TEC / (c × f²)
+# The delay scales as 1/f², so relative to 10 MHz:
+#   factor(f) = (10/f)²
 #
-# These factors are empirical multipliers relative to 10 MHz:
-#   delay_at_freq = base_delay × IONO_DELAY_FACTOR[freq]
+# Example: 2.5 MHz has (10/2.5)² = 16× more ionospheric delay than 10 MHz
 #
-# Values are approximate and vary with solar activity and time of day.
+# These factors are used ONLY as fallback when IonosphericDelayCalculator
+# is not available. The proper 1/f² model is used when the calculator is active.
+#
+# 2025-12-10 Fix: Corrected from linear approximation to proper 1/f² physics.
 # =============================================================================
+def _iono_delay_factor(freq_mhz: float, ref_freq: float = 10.0) -> float:
+    """Calculate ionospheric delay factor relative to reference frequency."""
+    return (ref_freq / freq_mhz) ** 2
+
 IONO_DELAY_FACTOR = {
-    2.5: 1.5,    # 2.5 MHz: 50% more delay (close to plasma frequency)
-    3.33: 1.3,   # CHU 3.33 MHz
-    5.0: 1.1,    # 5 MHz: 10% more delay
-    7.85: 1.05,  # CHU 7.85 MHz
-    10.0: 1.0,   # 10 MHz: reference frequency
-    14.67: 0.95, # CHU 14.67 MHz
-    15.0: 0.95,  # 15 MHz: 5% less delay
-    20.0: 0.9,   # 20 MHz: 10% less delay
-    25.0: 0.85,  # 25 MHz: 15% less delay
+    2.5: _iono_delay_factor(2.5),    # 2.5 MHz: 16.0× (was incorrectly 1.5×)
+    3.33: _iono_delay_factor(3.33),  # CHU 3.33 MHz: 9.0×
+    5.0: _iono_delay_factor(5.0),    # 5 MHz: 4.0×
+    7.85: _iono_delay_factor(7.85),  # CHU 7.85 MHz: 1.62×
+    10.0: _iono_delay_factor(10.0),  # 10 MHz: 1.0× (reference)
+    14.67: _iono_delay_factor(14.67),# CHU 14.67 MHz: 0.46×
+    15.0: _iono_delay_factor(15.0),  # 15 MHz: 0.44×
+    20.0: _iono_delay_factor(20.0),  # 20 MHz: 0.25×
+    25.0: _iono_delay_factor(25.0),  # 25 MHz: 0.16×
 }
 
 
@@ -535,62 +542,117 @@ class TransmissionTimeSolver:
         n_hops: int
     ) -> Tuple[float, float]:
         """
-        Calculate path length and elevation angle for N-hop ionospheric propagation.
+        Calculate signal path length and elevation angle for N-hop propagation.
         
-        GEOMETRY:
-        ---------
-        For N-hop propagation, the ground distance is divided into N equal segments.
-        Each segment involves an upward slant to the ionospheric layer and a
-        downward slant to the next ground reflection point.
+        This implements the geometric model for ionospheric reflection using
+        SPHERICAL EARTH geometry for accuracy on long paths.
         
-                            Layer (h km)
-                        ────────●────────
-                              ╱   ╲
-                       slant ╱     ╲ slant
-                            ╱       ╲
-                           ╱ θ       ╲
+                                Layer (height h)
+                            ────────●────────
+                                  ╱ ╲
+                           slant ╱   ╲ slant
+                          range ╱     ╲ range
+                               ╱       ╲
+                              ╱ θ       ╲
                     TX ───●───────────●─── (next hop or RX)
                        ← hop_distance →
         
-        EQUATIONS:
-        ----------
-        1. hop_distance = ground_distance / N_hops
-        2. half_hop = hop_distance / 2
-        3. elevation angle: θ = atan(h / half_hop)
-        4. slant_range = √(half_hop² + h²)
-        5. path_per_hop = 2 × slant_range (up and down)
-        6. total_path = path_per_hop × N_hops
+        SPHERICAL EARTH GEOMETRY (2025-12-10 Fix):
+        ------------------------------------------
+        For paths > 2000 km, flat-Earth approximation introduces ~1-3% error.
+        We use spherical geometry where:
         
-        ASSUMPTIONS:
-        ------------
-        - Flat Earth approximation (valid for hops < 2000 km)
-        - Specular reflection (mirror-like) from ionospheric layer
-        - Layer height is constant (reality: varies with location/time)
+        - Earth radius R_e = 6371 km
+        - Layer is at radius R_layer = R_e + h
+        - Ground distance d corresponds to central angle θ_ground = d / R_e
+        - Per-hop central angle θ_hop = θ_ground / N_hops
         
-        For paths > 2000 km, Earth curvature causes the actual path to be
-        slightly longer than this calculation. Error is ~1% at 2000 km.
+        For each hop, using the law of cosines in the triangle formed by:
+        - Earth center
+        - TX/RX point on surface  
+        - Reflection point at layer height
+        
+        slant_range = √(R_e² + R_layer² - 2·R_e·R_layer·cos(θ_hop/2))
+        
+        Elevation angle from law of sines:
+        sin(θ_elev + θ_hop/2) / R_layer = sin(θ_hop/2) / slant_range
+        
+        FALLBACK: For short paths (< 500 km), flat-Earth is used for speed
+        since the error is negligible (< 0.1%).
         
         Args:
             ground_distance_km: Great circle distance between TX and RX (km)
             layer_height_km: Ionospheric layer reflection height (km)
             n_hops: Number of ionospheric reflections (0 for ground wave)
-            
+        
         Returns:
             Tuple of (path_length_km, elevation_angle_deg)
             - path_length_km: Total signal path length through atmosphere
             - elevation_angle_deg: Takeoff angle from horizon at TX
-        
-        Example:
-            For WWV to Kansas (1500 km), 1-hop F2 at 300 km:
-            >>> path, elev = self._calculate_hop_path(1500, 300, 1)
-            >>> path   # ~1618 km (longer than ground distance)
-            >>> elev   # ~21.8° elevation angle
         """
         if n_hops == 0:
             # Ground wave: signal follows Earth's surface
             # Elevation angle is essentially 0° (grazing)
             return ground_distance_km, 0.0
         
+        # Use flat-Earth for short paths (< 500 km) - error < 0.1%
+        if ground_distance_km < 500:
+            return self._calculate_hop_path_flat(ground_distance_km, layer_height_km, n_hops)
+        
+        # Spherical Earth geometry for longer paths
+        R_e = EARTH_RADIUS_KM
+        R_layer = R_e + layer_height_km
+        
+        # Central angle for total ground distance (radians)
+        theta_ground = ground_distance_km / R_e
+        
+        # Central angle per hop
+        theta_hop = theta_ground / n_hops
+        half_theta = theta_hop / 2
+        
+        # Law of cosines for slant range
+        # Triangle: Earth center (O), surface point (A), reflection point (B)
+        # We want AB (slant range) given OA=R_e, OB=R_layer, angle AOB=half_theta
+        # AB² = OA² + OB² - 2·OA·OB·cos(AOB)
+        slant_range = math.sqrt(
+            R_e ** 2 + R_layer ** 2 - 2 * R_e * R_layer * math.cos(half_theta)
+        )
+        
+        # Elevation angle calculation using law of sines
+        # In triangle OAB: sin(OBA) / OA = sin(AOB) / AB
+        # Angle OBA is the angle at the reflection point
+        # sin(OBA) = R_e * sin(half_theta) / slant_range
+        sin_angle_at_layer = R_e * math.sin(half_theta) / slant_range
+        sin_angle_at_layer = max(-1.0, min(1.0, sin_angle_at_layer))
+        angle_at_layer = math.asin(sin_angle_at_layer)
+        
+        # The angle OAB (at surface point) = π - half_theta - angle_at_layer
+        # Elevation angle = OAB - π/2 (measured from local horizon)
+        angle_at_surface = math.pi - half_theta - angle_at_layer
+        elevation_rad = angle_at_surface - math.pi / 2
+        elevation_deg = math.degrees(elevation_rad)
+        
+        # Ensure non-negative elevation (can go slightly negative due to numerics)
+        elevation_deg = max(0.0, elevation_deg)
+        
+        # Each hop: up to layer and down = 2 × slant_range
+        path_per_hop = 2 * slant_range
+        total_path = path_per_hop * n_hops
+        
+        return total_path, elevation_deg
+    
+    def _calculate_hop_path_flat(
+        self,
+        ground_distance_km: float,
+        layer_height_km: float,
+        n_hops: int
+    ) -> Tuple[float, float]:
+        """
+        Flat-Earth approximation for short paths (< 500 km).
+        
+        This is the original algorithm, retained for efficiency on short paths
+        where spherical correction is negligible.
+        """
         # Divide ground distance equally among hops
         hop_distance = ground_distance_km / n_hops
         

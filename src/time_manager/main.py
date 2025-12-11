@@ -70,6 +70,23 @@ from .output.shm_writer import SHMWriter
 from .output.chrony_shm import ChronySHM
 
 
+def channel_name_to_dir(channel_name: str) -> str:
+    """
+    Convert channel name to directory-safe format.
+    
+    Examples:
+        "WWV 10 MHz" -> "WWV_10_MHz"
+        "CHU 3.33 MHz" -> "CHU_3.33_MHz"
+    
+    Args:
+        channel_name: Human-readable channel name with spaces
+        
+    Returns:
+        Directory-safe name with underscores
+    """
+    return channel_name.replace(' ', '_')
+
+
 class TimeManagerDaemon:
     """
     Main time-manager daemon.
@@ -192,13 +209,8 @@ class TimeManagerDaemon:
         logger.info("Initializing channel engines...")
         
         # Import from local timing module
-        # Later this will be refactored to use internal modules
         try:
-            # Try to import the Phase 2 engine from grape-recorder
-            # This allows us to test without duplicating code initially
-            sys.path.insert(0, str(Path.home() / 'grape-recorder' / 'src'))
             from .timing import Phase2TemporalEngine
-            # paths not needed - time-manager is standalone
             
             for channel_name in self.channels:
                 channel_dir = channel_name_to_dir(channel_name)
@@ -302,8 +314,6 @@ class TimeManagerDaemon:
         """
         try:
             # Find the data file for this minute
-            # paths not needed - time-manager is standalone
-            
             channel_dir = channel_name_to_dir(channel_name)
             minute_ts = minute * 60
             dt = datetime.fromtimestamp(minute_ts, tz=timezone.utc)
@@ -523,8 +533,6 @@ class TimeManagerDaemon:
             engines_to_process = self.channel_engines
         
         # Discover available minute files
-        # paths not needed - time-manager is standalone
-        
         all_minutes: Dict[str, List[int]] = {}
         
         for channel_name in engines_to_process.keys():
@@ -718,6 +726,12 @@ Examples:
         default='radiod.local',
         help='Radiod status multicast address for channel discovery (default: radiod.local)'
     )
+    parser.add_argument(
+        '--health-port',
+        type=int,
+        default=8080,
+        help='HTTP port for health monitoring endpoint (default: 8080, 0 to disable)'
+    )
     
     args = parser.parse_args()
     
@@ -786,7 +800,20 @@ Examples:
             status_address=status_addr
         )
         
-        engine.run()
+        # Start health monitoring server if enabled
+        health_server = None
+        health_port = config.get('output', {}).get('health_port', args.health_port)
+        if health_port > 0:
+            from .output.health_server import HealthServer
+            health_server = HealthServer(port=health_port)
+            health_server.set_engine(engine)
+            health_server.start()
+        
+        try:
+            engine.run()
+        finally:
+            if health_server:
+                health_server.stop()
     
     elif args.reprocess:
         # Reprocess mode: Read from disk files

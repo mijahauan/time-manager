@@ -185,11 +185,12 @@ class ChannelBuffer:
         
         # Add to full buffer (always, until full)
         if self.full_write_pos + n_samples <= self.full_size:
-            self.full_buffer[self.full_write_pos:self.full_write_pos + n_samples] = samples
-            self.full_write_pos += n_samples
-            
+            # Track start RTP timestamp before first write
             if self.full_write_pos == 0:
                 self.full_start_rtp = rtp_timestamp
+            
+            self.full_buffer[self.full_write_pos:self.full_write_pos + n_samples] = samples
+            self.full_write_pos += n_samples
         
         # Ring buffer: circular write
         # Calculate position in ring
@@ -259,7 +260,7 @@ class LiveTimeEngine:
     with Fast Loop (tone detection) and Slow Loop (discrimination).
     """
     
-    STATE_FILE = "/var/lib/grape-recorder/state/time_state.json"
+    STATE_FILE = "/var/lib/time-manager/state/time_state.json"
     SHM_PATH = "/dev/shm/grape_timing.json"
     
     def __init__(
@@ -346,7 +347,7 @@ class LiveTimeEngine:
         
         # Per-broadcast calibration (station+frequency -> offset)
         self.calibration: Dict[str, BroadcastCalibration] = {}
-        self.calibration_file = Path("/var/lib/grape-recorder/state/broadcast_calibration.json")
+        self.calibration_file = Path("/var/lib/time-manager/state/broadcast_calibration.json")
         self._load_calibration()
         
         # History for calibration learning (broadcast_key -> list of d_clock values)

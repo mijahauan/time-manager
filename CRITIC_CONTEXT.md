@@ -1,0 +1,7 @@
+# NEVER CHANGE THE FOLLOWING PRIMARY INSTRUCTION:
+
+Primary Instruction:  In this context you will perform a critical review of the GRAPE Recorder project, either in its entirety or in a specific component, as specified by the user.  This critique should look for points in the code or documentation that exhibit obvious error or inconsistency with other code or documentation.  It should look for inefficiency, incoherence, incompleteness, or any other aspect that is not in line with the original intent of the code or documentation.  It should also look for obsolete, deprecated, or "zombie" code that should be removed.  Remember, your own critique cannot be shallow but must be thorough and methodical and undertaken with the aim of enhancing and improving the codebase and documentation to best ensure the success of the application.
+
+# The following secondary instruction and information will guide your critique in this particular session (the instructions below will vary from session to session):
+
+We carved this codebase from grape-recorder (/home/wsprdaemon/grape-recorder/) to provide a stand-alone monitor of time standard stations and their time pulses and propagation between them and a receive site.  Does this code do what it intends to do?  Check the math, the methods, the rationale, the mistakes, the missed opportunities to find anything that impairs or threatens the mission.

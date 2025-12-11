@@ -2,6 +2,109 @@
 
 All notable changes to time-manager will be documented in this file.
 
+## [0.3.0] - 2025-12-10
+
+### Code Quality & Infrastructure Improvements
+
+This release focuses on code correctness, test coverage, and operational infrastructure
+following a comprehensive code review.
+
+### Added
+
+- **Unit Test Suite**: 30 comprehensive tests covering critical modules:
+  - `test_chrony_shm.py`: Struct packing, size verification, field offsets
+  - `test_transmission_time_solver.py`: Spherical geometry, ionospheric delays
+  - `test_live_time_engine.py`: Buffer logic, state management, paths
+  - `test_health_server.py`: HTTP endpoints, Prometheus metrics
+
+- **Health Monitoring Server** (`output/health_server.py`):
+  - `GET /health` - Basic health check (200 OK)
+  - `GET /status` - JSON timing status with all metrics
+  - `GET /metrics` - Prometheus-compatible metrics export
+  - Integrated into main.py with `--health-port` argument (default: 8080)
+
+- **Modern Python Packaging** (`pyproject.toml`):
+  - Proper dependency management with optional extras
+  - `pip install -e ".[dev]"` for development
+  - `pip install -e ".[all]"` for all features
+  - pytest configuration included
+
+### Fixed
+
+- **Chrony SHM Struct Size**: Corrected from 96 to **92 bytes** to match actual
+  chronyd `struct shmTime` on 64-bit Linux with native alignment.
+  ```python
+  # Correct format: 92 bytes
+  struct.pack('@iiqiqiiiiiii8i', ...)
+  ```
+
+- **Spherical Earth Geometry**: Fixed elevation angle calculation in
+  `_calculate_hop_path()` for paths ≥500 km. Previous flat-Earth approximation
+  caused 1-3% timing errors on long paths (WWV→Hawaii: ~4000 km).
+  - Elevation angles now correctly decrease with distance
+  - Uses law of cosines for slant range calculation
+  - Uses law of sines for elevation angle derivation
+
+- **Ionospheric Delay Factors**: Corrected to use proper 1/f² physics:
+  ```python
+  # Before (incorrect linear approximation):
+  2.5 MHz: 1.5×
+  
+  # After (correct inverse-square):
+  2.5 MHz: 16.0×  # (10/2.5)² = 16
+  ```
+
+- **Path References**: Updated all `grape-recorder` paths to `time-manager`:
+  - State file: `/var/lib/time-manager/state/time_state.json`
+  - Calibration: `/var/lib/time-manager/state/broadcast_calibration.json`
+
+- **Ring Buffer RTP Tracking**: Fixed `full_start_rtp` assignment to occur
+  before incrementing write position (was never being set).
+
+- **Missing Import**: Added `import mmap` to `chrony_shm.py`.
+
+- **Missing Function**: Added `channel_name_to_dir()` to `main.py`.
+
+### Changed
+
+- **Sample Rate Constant**: Renamed `SAMPLE_RATE_FULL` → `SAMPLE_RATE` (20000 Hz),
+  removed deprecated `SAMPLE_RATE_LEGACY`.
+
+### Technical Details
+
+#### Spherical Earth Geometry
+
+For ionospheric hop calculations on paths ≥500 km:
+
+```
+Given:
+  R_e = 6371 km (Earth radius)
+  R_layer = R_e + layer_height (e.g., 300 km for F2)
+  θ = ground_distance / R_e (central angle)
+
+Slant range (law of cosines):
+  slant² = R_e² + R_layer² - 2·R_e·R_layer·cos(θ/2)
+
+Elevation angle (law of sines):
+  sin(angle_at_layer) = R_e·sin(θ/2) / slant
+  elevation = π/2 - θ/2 - angle_at_layer
+```
+
+#### Test Coverage
+
+```
+tests/
+├── conftest.py              # Shared fixtures
+├── test_chrony_shm.py       # 6 tests
+├── test_health_server.py    # 7 tests  
+├── test_live_time_engine.py # 8 tests
+└── test_transmission_time_solver.py  # 9 tests
+```
+
+Run with: `pytest tests/ -v`
+
+---
+
 ## [0.2.0] - 2025-12-10
 
 ### Major Changes: UTC(NIST) Back-Calculation & Chrony Integration

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "time-manager"
+version = "1.0.0"
+description = "Precision HF Time Transfer Daemon for WWV/WWVH/CHU"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Michael James Hauan", email = "ac0g@arrl.net"}
+]
+requires-python = ">=3.9"
+keywords = ["wwv", "wwvh", "chu", "time", "synchronization", "chrony", "ntp", "radio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: System :: Networking :: Time Synchronization",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "toml>=0.10.0",
+]
+
+[project.optional-dependencies]
+chrony = ["sysv_ipc>=1.1.0"]
+zmq = ["pyzmq>=22.0.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+all = [
+    "sysv_ipc>=1.1.0",
+    "pyzmq>=22.0.0",
+]
+
+[project.scripts]
+time-manager = "time_manager.main:main"
+
+[project.urls]
+Homepage = "https://github.com/HamSCI/time-manager"
+Documentation = "https://github.com/HamSCI/time-manager#readme"
+Repository = "https://github.com/HamSCI/time-manager.git"
+Issues = "https://github.com/HamSCI/time-manager/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]  # Line too long - handled by black

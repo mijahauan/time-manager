@@ -36,6 +36,7 @@ Reference:
 """
 
 import logging
+import mmap
 import os
 import struct
 import time
@@ -50,7 +51,8 @@ logger = logging.getLogger(__name__)
 SHM_KEY_BASE = 0x4e545030
 
 # SHM segment size (must match chronyd expectation)
-SHM_SIZE = 96  # bytes
+# struct shmTime on 64-bit Linux: 92 bytes with alignment padding
+SHM_SIZE = 92  # bytes
 
 
 class ChronySHM:
@@ -201,36 +203,36 @@ class ChronySHM:
             clock_nsec = int((system_time - clock_sec) * 1_000_000_000) % 1_000_000_000
             recv_nsec = int((reference_time - recv_sec) * 1_000_000_000) % 1_000_000_000
             
-            # Pack the SHM structure for 64-bit Linux (96 bytes total)
-            # Format: @iiqiiqiiiiii8i with proper alignment
+            # Pack the SHM structure for 64-bit Linux (92 bytes total)
+            # Format matches chronyd's struct shmTime with native alignment
             # 
             # Layout (with native alignment):
             #   0-3:   int mode
             #   4-7:   int count
             #   8-15:  time_t clockTimeStampSec (64-bit)
             #   16-19: int clockTimeStampUSec
-            #   20-23: (padding for 8-byte alignment)
+            #   20-23: (padding for 8-byte alignment of next time_t)
             #   24-31: time_t receiveTimeStampSec (64-bit)
             #   32-35: int receiveTimeStampUSec
-            #   36-39: (padding for 8-byte alignment)  
-            #   40-43: int leap
-            #   44-47: int precision
-            #   48-51: int nsamples
-            #   52-55: int valid
-            #   56-59: unsigned clockTimeStampNSec
-            #   60-63: unsigned receiveTimeStampNSec
-            #   64-95: int dummy[8]
+            #   36-39: int leap
+            #   40-43: int precision
+            #   44-47: int nsamples
+            #   48-51: int valid
+            #   52-55: int clockTimeStampNSec
+            #   56-59: int receiveTimeStampNSec
+            #   60-91: int dummy[8]
+            #
+            # Note: Native alignment (@) automatically adds 4-byte padding
+            # after clockTimeStampUSec to align receiveTimeStampSec to 8 bytes.
             
             data = struct.pack(
-                '@ii q i xxxx q i xxxx iiii II 8i',
+                '@iiqiqiiiiiii8i',
                 1,              # mode = 1 (use count locking)
                 self.count,     # count (sequence number)
                 clock_sec,      # clockTimeStampSec (system time)
                 clock_usec,     # clockTimeStampUSec
-                # xxxx padding
                 recv_sec,       # receiveTimeStampSec (reference/true time)
                 recv_usec,      # receiveTimeStampUSec
-                # xxxx padding
                 leap,           # leap
                 precision,      # precision
                 1,              # nsamples

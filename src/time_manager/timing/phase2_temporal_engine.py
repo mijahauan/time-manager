@@ -213,7 +213,7 @@ logger = logging.getLogger(__name__)
 # Phase 1 stores data as np.complex64 (32-bit float I + 32-bit float Q)
 # This provides 144 dB dynamic range vs 96 dB for 16-bit int
 EXPECTED_DTYPE = np.complex64
-SAMPLE_RATE_FULL = 20000      # Phase 1 archive sample rate
+SAMPLE_RATE = 20000      # Phase 1 archive sample rate
 
 # Decimation for tone detection
 # Note: Decimation was considered but removed - tone detection now uses full rate
@@ -426,7 +426,7 @@ class Phase2TemporalEngine:
         channel_name: str,
         frequency_hz: float,
         receiver_grid: str,
-        sample_rate: int = SAMPLE_RATE_FULL,
+        sample_rate: int = SAMPLE_RATE,
         precise_lat: Optional[float] = None,
         precise_lon: Optional[float] = None
     ):
@@ -1516,7 +1516,7 @@ def create_phase2_engine(
     channel_name: str,
     frequency_hz: float,
     receiver_grid: str,
-    sample_rate: int = SAMPLE_RATE_FULL
+    sample_rate: int = SAMPLE_RATE
 ) -> Phase2TemporalEngine:
     """
     Create a Phase 2 Temporal Engine with standard configuration.
