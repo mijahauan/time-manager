@@ -1021,7 +1021,8 @@ class TransmissionTimeSolver:
         doppler_std_hz: float = 0.0,
         fss_db: Optional[float] = None,
         expected_second_rtp: Optional[int] = None,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        timing_error_ms: Optional[float] = None
     ) -> SolverResult:
         """
         Solve for transmission time by identifying propagation mode.
@@ -1035,6 +1036,7 @@ class TransmissionTimeSolver:
             fss_db: Frequency Selectivity Strength (D-layer indicator)
             expected_second_rtp: RTP timestamp of expected second boundary
             timestamp: UTC datetime of observation (for dynamic ionosphere model)
+            timing_error_ms: Direct timing error from tone detector (preferred over RTP calculation)
             
         Returns:
             SolverResult with mode identification and back-calculated time
@@ -1071,8 +1073,12 @@ class TransmissionTimeSolver:
             logger.warning(f"No valid propagation modes for {station} at {ground_distance:.0f} km")
             return self._no_solution(arrival_rtp)
         
-        # Calculate observed delay (from expected second boundary)
-        if expected_second_rtp is not None:
+        # Calculate observed delay
+        # Prefer timing_error_ms from tone detector (already relative to minute boundary)
+        # Fall back to RTP calculation if not provided
+        if timing_error_ms is not None:
+            observed_delay_ms = timing_error_ms
+        elif expected_second_rtp is not None:
             observed_delay_samples = arrival_rtp - expected_second_rtp
             observed_delay_ms = (observed_delay_samples / self.sample_rate) * 1000
         else:
@@ -1093,6 +1099,12 @@ class TransmissionTimeSolver:
         scored_candidates.sort(key=lambda x: x[0], reverse=True)
         
         best_score, best_candidate = scored_candidates[0]
+        
+        # Diagnostic: log mode selection details
+        logger.info(f"Mode selection for {station} @ {frequency_mhz}MHz: "
+                   f"observed={observed_delay_ms:.2f}ms, "
+                   f"best={best_candidate.mode.value}({best_candidate.total_delay_ms:.2f}ms), "
+                   f"candidates=[{', '.join(f'{c.mode.value}:{c.total_delay_ms:.1f}ms' for _, c in scored_candidates[:3])}]")
         
         # Calculate mode separation (confidence indicator)
         if len(scored_candidates) > 1:

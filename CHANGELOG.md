@@ -2,6 +2,59 @@
 
 All notable changes to time-manager will be documented in this file.
 
+## [0.4.0] - 2025-12-11
+
+### Live Timing Engine Fixes
+
+This release fixes critical timing issues in the LiveTimeEngine that were causing
+55-second offsets in D_clock calculations.
+
+### Fixed
+
+- **Slow Loop Buffer Routing**: Fixed sample routing logic that was missing the
+  minute boundary tone at :00. Samples at :00-:54 now correctly route to the
+  current minute's buffer (which contains the tone), not the previous minute.
+
+- **Buffer system_time Calculation**: Fixed `system_time` passed to Phase 2 engine.
+  Now uses `(minute * 60) - 5.0` to correctly represent buffer start time,
+  instead of using `start_wallclock` which varied based on when samples arrived.
+
+- **GPS Time Conversion** (ka9q-python): Fixed `rtp_to_wallclock()` GPS-to-Unix
+  time conversion that was producing timestamps ~50 years in the future.
+
+- **Tone Re-detection**: Removed duplicate detection check that was preventing
+  the Slow Loop's Phase 2 tone detector from finding tones already seen by
+  the Fast Loop.
+
+### Changed
+
+- **Buffer Size**: Reduced odd/even minute buffers from 70s to 60s (1.2M samples
+  each). The 60-second window (-5s to +55s around minute boundary) is sufficient
+  for tone detection with 5s pre-roll.
+
+- **Slow Loop Timing**: Changed from T=:02 to T=:06 to ensure buffers are
+  complete before processing (buffer fills until :55, processed at :06).
+
+### Current Status
+
+- **Fast Loop**: Working correctly, producing D_clock values of +8-12ms
+- **Slow Loop**: Now detecting tones and producing D_clock values of +10-33ms
+- **Kalman Filter**: Convergence issues remain (see Known Issues)
+
+### Known Issues
+
+- **Kalman Convergence**: The Kalman filter shows large innovations and slow
+  convergence. Some Slow Loop measurements still show `observed=0.00ms` and
+  produce 55-second offsets, which corrupt the Kalman state.
+
+- **Mixed Results**: Some channels produce good D_clock values while others
+  on the same run produce 55-second offsets. Root cause under investigation.
+
+- **MAD Outlier Rejection**: With mixed good/bad measurements, the MAD-based
+  outlier rejection may not effectively filter the bad values.
+
+---
+
 ## [0.3.0] - 2025-12-10
 
 ### Code Quality & Infrastructure Improvements

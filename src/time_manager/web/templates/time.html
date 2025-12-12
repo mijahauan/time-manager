@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Time Analysis - time-manager</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">
+            <span class="nav-logo">&#9201;</span>
+            <span>time-manager</span>
+        </div>
+        <div class="nav-links">
+            <a href="/time" class="nav-link active">Time Analysis</a>
+            <a href="/discrimination" class="nav-link">Discrimination</a>
+        </div>
+        <div class="nav-status">
+            <span id="clock-status" class="status-badge status-unknown">--</span>
+            <span id="d-clock-value">-- ms</span>
+        </div>
+    </nav>
+
+    <main class="container">
+        <!-- Status Cards -->
+        <section class="section">
+            <div class="section-title">Current Timing Status</div>
+            <div class="status-grid">
+                <div class="status-card">
+                    <div class="status-label">D_clock (System - UTC)</div>
+                    <div class="status-value" id="status-d-clock">--</div>
+                    <div class="status-unit">milliseconds</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-label">Uncertainty (1σ)</div>
+                    <div class="status-value" id="status-uncertainty">--</div>
+                    <div class="status-unit">milliseconds</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-label">Quality Grade</div>
+                    <div class="status-value" id="status-quality">--</div>
+                    <div class="status-unit">A=best, D=poor</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-label">Active Channels</div>
+                    <div class="status-value" id="status-channels">--</div>
+                    <div class="status-unit">broadcasts</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Chrony Source Comparison -->
+        <section class="section">
+            <div class="section-header">
+                <div class="section-title">Chrony Source Comparison</div>
+                <div class="section-controls">
+                    <select id="chrony-window" class="control-select">
+                        <option value="15">15 minutes</option>
+                        <option value="60" selected>1 hour</option>
+                        <option value="180">3 hours</option>
+                        <option value="360">6 hours</option>
+                    </select>
+                </div>
+            </div>
+            <div class="chart-container">
+                <div id="chrony-chart" class="chart"></div>
+            </div>
+            <div class="chart-description">
+                Compares time-manager (TMGR) offset against GPS reference (192.168.0.134) and best NTP server.
+                Lower absolute offset indicates better agreement with system clock.
+            </div>
+        </section>
+
+        <!-- Kalman Funnel Chart -->
+        <section class="section">
+            <div class="section-header">
+                <div class="section-title">Clock Stability Convergence (Kalman Funnel)</div>
+                <div class="section-controls">
+                    <select id="funnel-window" class="control-select">
+                        <option value="15">15 minutes</option>
+                        <option value="60" selected>1 hour</option>
+                        <option value="180">3 hours</option>
+                        <option value="360">6 hours</option>
+                        <option value="720">12 hours</option>
+                        <option value="1440">24 hours</option>
+                    </select>
+                </div>
+            </div>
+            <div class="chart-container">
+                <div id="kalman-funnel-chart" class="chart"></div>
+            </div>
+            <div class="chart-description">
+                Shows fused D_clock with uncertainty bounds over time. The "funnel" narrows as clock lock improves.
+                Blue band = locked state, gray = hold state. Red X marks = anomalies outside expected bounds.
+            </div>
+        </section>
+
+        <!-- Two-column layout for Constellation and Probability -->
+        <div class="charts-row">
+            <!-- Constellation Radar -->
+            <section class="section half-width">
+                <div class="section-title">Station Constellation (Timing Error by Azimuth)</div>
+                <div class="chart-container square">
+                    <div id="constellation-chart" class="chart"></div>
+                </div>
+                <div class="chart-description">
+                    Polar plot showing timing error by station direction. Center = perfect UTC (0 error).
+                    Puck color: green = good (&lt;1ms), yellow = fair (&lt;5ms), red = poor.
+                </div>
+            </section>
+
+            <!-- Probability Peak -->
+            <section class="section half-width">
+                <div class="section-title">Consensus Time Distribution (KDE)</div>
+                <div class="chart-container square">
+                    <div id="probability-peak-chart" class="chart"></div>
+                </div>
+                <div class="chart-description">
+                    Kernel density estimate of clock offset estimates. Sharp peak = agreement across stations.
+                    Double-hump indicates mode ambiguity or multipath.
+                </div>
+            </section>
+        </div>
+
+        <!-- Mode Probability Ridge -->
+        <section class="section">
+            <div class="section-header">
+                <div class="section-title">Propagation Mode Probability</div>
+                <div class="section-controls">
+                    <select id="mode-channel" class="control-select">
+                        <option value="">Auto (best SNR)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="chart-container">
+                <div id="mode-ridge-chart" class="chart"></div>
+            </div>
+            <div class="chart-description">
+                Ridgeline showing probability of each propagation mode (1F, 2F, 3F, etc.).
+                Red vertical line = measured delay. Higher peaks = more likely mode.
+            </div>
+        </section>
+
+        <!-- Channel Table -->
+        <section class="section">
+            <div class="section-title">Channel Status</div>
+            <div class="table-container">
+                <table class="data-table" id="channel-table">
+                    <thead>
+                        <tr>
+                            <th>Channel</th>
+                            <th>Station</th>
+                            <th>Mode</th>
+                            <th>Delay (ms)</th>
+                            <th>D_clock (ms)</th>
+                            <th>SNR (dB)</th>
+                            <th>Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td colspan="7" class="loading">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>Last update: <span id="last-update">--</span></span>
+        <span>time-manager v0.1.0</span>
+    </footer>
+
+    <script src="/static/js/timing-visualizations.js"></script>
+    <script>
+        // Initialize charts
+        let kalmanChart, constellationChart, probabilityChart, modeChart;
+        let eventSource = null;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Initialize visualization components
+            kalmanChart = new KalmanFunnelChart('kalman-funnel-chart', {
+                yAxisRange: [-10, 10]
+            });
+            constellationChart = new ConstellationRadar('constellation-chart', {
+                maxRadius: 10
+            });
+            probabilityChart = new ProbabilityPeak('probability-peak-chart', {
+                xRange: [-5, 5]
+            });
+            modeChart = new ModeProbabilityRidge('mode-ridge-chart');
+
+            // Load initial data
+            loadAllData();
+
+            // Set up auto-refresh
+            setInterval(loadAllData, 30000);  // Refresh every 30 seconds
+
+            // Set up SSE for real-time updates
+            connectSSE();
+
+            // Event listeners
+            document.getElementById('funnel-window').addEventListener('change', loadKalmanFunnel);
+            document.getElementById('chrony-window').addEventListener('change', loadChronyChart);
+            document.getElementById('mode-channel').addEventListener('change', loadModeProbability);
+        });
+
+        function connectSSE() {
+            if (eventSource) {
+                eventSource.close();
+            }
+            
+            eventSource = new EventSource('/events');
+            
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'timing') {
+                    updateStatusCards(data);
+                }
+            };
+            
+            eventSource.onerror = () => {
+                // Reconnect after 5 seconds
+                setTimeout(connectSSE, 5000);
+            };
+        }
+
+        async function loadAllData() {
+            try {
+                await Promise.all([
+                    loadTimingStatus(),
+                    loadChronyChart(),
+                    loadKalmanFunnel(),
+                    loadConstellation(),
+                    loadConsensus(),
+                    loadModeProbability(),
+                    loadChannels()
+                ]);
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+            } catch (error) {
+                console.error('Error loading data:', error);
+            }
+        }
+
+        async function loadTimingStatus() {
+            const response = await fetch('/api/timing');
+            const data = await response.json();
+            updateStatusCards(data);
+        }
+
+        function updateStatusCards(data) {
+            document.getElementById('status-d-clock').textContent = 
+                data.d_clock_ms !== undefined ? data.d_clock_ms.toFixed(3) : '--';
+            document.getElementById('status-uncertainty').textContent = 
+                data.d_clock_uncertainty_ms !== undefined ? data.d_clock_uncertainty_ms.toFixed(3) : '--';
+            document.getElementById('status-quality').textContent = 
+                data.quality_grade || '--';
+            
+            const channels = data.channels ? Object.keys(data.channels).length : 0;
+            document.getElementById('status-channels').textContent = channels;
+
+            // Update navbar status
+            const statusBadge = document.getElementById('clock-status');
+            const status = data.clock_status || 'UNKNOWN';
+            statusBadge.textContent = status;
+            statusBadge.className = 'status-badge status-' + status.toLowerCase();
+
+            document.getElementById('d-clock-value').textContent = 
+                data.d_clock_ms !== undefined ? data.d_clock_ms.toFixed(2) + ' ms' : '-- ms';
+        }
+
+        async function loadChronyChart() {
+            const minutes = document.getElementById('chrony-window').value;
+            const response = await fetch(`/api/chrony/history?minutes=${minutes}`);
+            const data = await response.json();
+            
+            if (data.history && data.history.length > 0) {
+                const timestamps = data.history.map(h => new Date(h.timestamp * 1000));
+                const tmgrOffsets = data.history.map(h => h.tmgr_offset_ms);
+                const gpsOffsets = data.history.map(h => h.gps_offset_ms);
+                const ntpOffsets = data.history.map(h => h.best_ntp_offset_ms);
+                
+                const traces = [
+                    {
+                        x: timestamps,
+                        y: tmgrOffsets,
+                        name: 'TMGR (time-manager)',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: '#00d4aa', width: 2 },
+                        marker: { size: 4 }
+                    },
+                    {
+                        x: timestamps,
+                        y: gpsOffsets,
+                        name: 'GPS (192.168.0.134)',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: '#ffd700', width: 2 },
+                        marker: { size: 4 }
+                    },
+                    {
+                        x: timestamps,
+                        y: ntpOffsets,
+                        name: 'Best NTP',
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        line: { color: '#888888', width: 1, dash: 'dot' },
+                        marker: { size: 3 }
+                    }
+                ];
+                
+                // Calculate dynamic y-axis range using 95th percentile to ignore outliers
+                const allOffsets = [...tmgrOffsets, ...gpsOffsets, ...ntpOffsets].filter(v => v !== null);
+                const absOffsets = allOffsets.map(Math.abs).sort((a, b) => a - b);
+                const p95Index = Math.floor(absOffsets.length * 0.95);
+                const p95Value = absOffsets.length > 0 ? absOffsets[Math.min(p95Index, absOffsets.length - 1)] : 2;
+                const yRange = Math.max(2, p95Value * 1.2);  // At least +/-2ms, or 20% padding on 95th percentile
+                
+                const layout = {
+                    paper_bgcolor: 'rgba(0,0,0,0)',
+                    plot_bgcolor: 'rgba(30,41,59,0.5)',
+                    font: { color: '#94a3b8' },
+                    margin: { t: 30, r: 30, b: 50, l: 60 },
+                    xaxis: {
+                        title: 'Time',
+                        gridcolor: 'rgba(148,163,184,0.1)',
+                        tickformat: '%H:%M'
+                    },
+                    yaxis: {
+                        title: 'Offset from System Clock (ms)',
+                        gridcolor: 'rgba(148,163,184,0.1)',
+                        zeroline: true,
+                        zerolinecolor: 'rgba(148,163,184,0.3)',
+                        range: [-yRange, yRange]
+                    },
+                    legend: {
+                        orientation: 'h',
+                        y: 1.1,
+                        x: 0.5,
+                        xanchor: 'center'
+                    },
+                    showlegend: true
+                };
+                
+                Plotly.react('chrony-chart', traces, layout, {responsive: true});
+            } else {
+                // Show placeholder when no data
+                Plotly.react('chrony-chart', [], {
+                    paper_bgcolor: 'rgba(0,0,0,0)',
+                    plot_bgcolor: 'rgba(30,41,59,0.5)',
+                    font: { color: '#94a3b8' },
+                    xaxis: { title: 'Time' },
+                    yaxis: { title: 'Offset (ms)' },
+                    annotations: [{
+                        text: 'Waiting for chrony data...',
+                        showarrow: false,
+                        font: { size: 16, color: '#64748b' }
+                    }]
+                }, {responsive: true});
+            }
+        }
+
+        async function loadKalmanFunnel() {
+            const minutes = document.getElementById('funnel-window').value;
+            const response = await fetch(`/api/timing/history?minutes=${minutes}`);
+            const data = await response.json();
+            
+            if (data.history && data.history.length > 0) {
+                const points = data.history.map(h => ({
+                    timestamp: h.timestamp,
+                    offset_ms: h.d_clock_fused_ms || h.d_clock_raw_ms || 0,
+                    uncertainty_ms: h.uncertainty_ms || 2.0,
+                    status: h.uncertainty_ms < 2.0 ? 'LOCKED' : 'HOLD'
+                }));
+                kalmanChart.update(points);
+            }
+        }
+
+        async function loadConstellation() {
+            const response = await fetch('/api/timing/constellation');
+            const data = await response.json();
+            constellationChart.update(data);
+        }
+
+        async function loadConsensus() {
+            const response = await fetch('/api/timing/consensus');
+            const data = await response.json();
+            
+            if (data.estimates && data.estimates.length > 0) {
+                probabilityChart.update(data.estimates);
+            }
+        }
+
+        async function loadModeProbability() {
+            const channelSelect = document.getElementById('mode-channel');
+            const channel = channelSelect.value;
+            const url = channel ? `/api/timing/mode-probability?channel=${encodeURIComponent(channel)}` : '/api/timing/mode-probability';
+            
+            const response = await fetch(url);
+            const data = await response.json();
+            
+            if (data.available && data.candidates) {
+                modeChart.update(data);
+            }
+        }
+
+        async function loadChannels() {
+            const response = await fetch('/api/channels');
+            const data = await response.json();
+            
+            // Update channel selector for mode probability
+            const channelSelect = document.getElementById('mode-channel');
+            const currentValue = channelSelect.value;
+            channelSelect.innerHTML = '<option value="">Auto (best SNR)</option>';
+            
+            if (data.channels) {
+                data.channels.forEach(ch => {
+                    const option = document.createElement('option');
+                    option.value = ch.name;
+                    option.textContent = `${ch.name} (${ch.station})`;
+                    channelSelect.appendChild(option);
+                });
+            }
+            channelSelect.value = currentValue;
+
+            // Update channel table
+            const tbody = document.querySelector('#channel-table tbody');
+            
+            // Also fetch timing data for D_clock values
+            const timingResponse = await fetch('/api/timing');
+            const timingData = await timingResponse.json();
+            
+            if (data.channels && data.channels.length > 0) {
+                tbody.innerHTML = data.channels.map(ch => {
+                    const timing = timingData.channels?.[ch.name] || {};
+                    const validClass = ch.valid ? 'valid' : 'invalid';
+                    return `
+                        <tr class="${validClass}">
+                            <td>${ch.name}</td>
+                            <td><span class="station-badge station-${ch.station?.toLowerCase()}">${ch.station || '--'}</span></td>
+                            <td>${ch.propagation_mode || '--'}</td>
+                            <td>${timing.propagation_delay_ms?.toFixed(2) || '--'}</td>
+                            <td>${timing.d_clock_raw_ms?.toFixed(3) || '--'}</td>
+                            <td>${ch.snr_db?.toFixed(1) || '--'}</td>
+                            <td>${(timing.confidence * 100)?.toFixed(0) || '--'}%</td>
+                        </tr>
+                    `;
+                }).join('');
+            } else {
+                tbody.innerHTML = '<tr><td colspan="7" class="no-data">No channels available</td></tr>';
+            }
+        }
+    </script>
+</body>
+</html>

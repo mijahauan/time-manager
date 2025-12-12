@@ -785,7 +785,48 @@ Examples:
         rtp_config = config.get('rtp', {})
         multicast_addr = rtp_config.get('multicast_address', args.multicast)
         rtp_port = rtp_config.get('port', args.port)
-        status_addr = rtp_config.get('status_address', args.status_addr)
+        status_addr = rtp_config.get('status_address')
+        
+        # If no status_address configured, discover available radiod instances
+        if not status_addr:
+            try:
+                from ka9q.discovery import discover_radiod_services
+                logger.info("No status_address configured, discovering radiod instances...")
+                services = discover_radiod_services(timeout=3.0)
+                
+                if not services:
+                    logger.error("No radiod instances found on the network.")
+                    logger.error("Please configure 'status_address' in [rtp] section of config file.")
+                    sys.exit(1)
+                elif len(services) == 1:
+                    status_addr = services[0]
+                    logger.info(f"Found radiod: {status_addr}")
+                else:
+                    print("\nAvailable radiod instances:")
+                    for i, svc in enumerate(services, 1):
+                        print(f"  {i}. {svc}")
+                    print()
+                    while True:
+                        try:
+                            choice = input(f"Select radiod instance [1-{len(services)}]: ").strip()
+                            idx = int(choice) - 1
+                            if 0 <= idx < len(services):
+                                status_addr = services[idx]
+                                break
+                            print(f"Please enter a number between 1 and {len(services)}")
+                        except ValueError:
+                            print("Please enter a valid number")
+                        except (KeyboardInterrupt, EOFError):
+                            print("\nAborted.")
+                            sys.exit(1)
+                    logger.info(f"Selected radiod: {status_addr}")
+            except ImportError:
+                logger.error("ka9q-python not installed. Please install it or configure status_address manually.")
+                sys.exit(1)
+            except Exception as e:
+                logger.error(f"Failed to discover radiod: {e}")
+                logger.error("Please configure 'status_address' in [rtp] section of config file.")
+                sys.exit(1)
         
         engine = LiveTimeEngine(
             multicast_address=multicast_addr,
@@ -800,20 +841,20 @@ Examples:
             status_address=status_addr
         )
         
-        # Start health monitoring server if enabled
-        health_server = None
-        health_port = config.get('output', {}).get('health_port', args.health_port)
-        if health_port > 0:
-            from .output.health_server import HealthServer
-            health_server = HealthServer(port=health_port)
-            health_server.set_engine(engine)
-            health_server.start()
+        # Start web server (includes health endpoints + GUI)
+        web_server = None
+        web_port = config.get('output', {}).get('health_port', args.health_port)
+        if web_port > 0:
+            from .web import WebServer
+            web_server = WebServer(port=web_port)
+            web_server.set_engine(engine)
+            web_server.start()
         
         try:
             engine.run()
         finally:
-            if health_server:
-                health_server.stop()
+            if web_server:
+                web_server.stop()
     
     elif args.reprocess:
         # Reprocess mode: Read from disk files

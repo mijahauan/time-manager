@@ -1100,8 +1100,14 @@ class Phase2TemporalEngine:
         
         # For shared frequencies only: use discrimination
         if not station:
-            # Priority 1: Ground truth (500/600 Hz exclusive minutes, 440 Hz)
-            if channel.ground_truth_station:
+            # Priority 1: Tone detector station (1000Hz=WWV, 1200Hz=WWVH)
+            # This is the most reliable indicator from Pass 0
+            if time_snap.anchor_station not in ['UNKNOWN', 'BALANCED', None, '']:
+                station = time_snap.anchor_station
+                logger.debug(f"Station from tone detector (anchor_station): {station}")
+            
+            # Priority 2: Ground truth (500/600 Hz exclusive minutes, 440 Hz)
+            elif channel.ground_truth_station:
                 station = channel.ground_truth_station
                 logger.debug(f"Station from ground truth: {station}")
             
@@ -1159,7 +1165,8 @@ class Phase2TemporalEngine:
                 delay_spread_ms=delay_spread_ms,
                 doppler_std_hz=doppler_std_hz,
                 fss_db=fss_db,
-                expected_second_rtp=expected_second_rtp
+                expected_second_rtp=expected_second_rtp,
+                timing_error_ms=time_snap.timing_error_ms  # Use tone detector's measurement directly
             )
             
             # Extract D_clock

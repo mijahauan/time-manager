@@ -154,6 +154,7 @@ from pathlib import Path
 
 # Issue 4.1 Fix (2025-12-07): Import coordinates from single source of truth
 from .wwv_constants import WWV_LAT, WWV_LON, WWVH_LAT, WWVH_LON
+from .ionospheric_model import IonosphericModel
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,9 @@ class WWVGeographicPredictor:
         self.receiver_lat, self.receiver_lon = self.grid_to_latlon(receiver_grid)
         self.history_file = history_file
         self.max_history = max_history
+        
+        # Dynamic ionospheric model for layer heights
+        self._iono_model = IonosphericModel(enable_iri=True, enable_calibration=True)
         
         # Historical ToA measurements for empirical refinement
         # Structure: {frequency_mhz: deque([{time, peak_delay_ms, station}, ...])}
@@ -280,34 +284,61 @@ class WWVGeographicPredictor:
     def _estimate_propagation_delay(
         self,
         distance_km: float,
-        frequency_mhz: float
+        frequency_mhz: float,
+        timestamp: Optional[datetime] = None
     ) -> float:
         """
-        Estimate ionospheric propagation delay
+        Estimate ionospheric propagation delay using dynamic ionospheric model.
         
-        Uses simplified ionospheric model:
-        - HF signals reflect from F2 layer (~300 km altitude typical)
-        - Lower frequencies penetrate higher (longer path)
-        - Path length ≈ geometric path with ionospheric reflection
+        Uses IonosphericModel for time-varying layer heights that account for:
+        - Diurnal variation (day/night cycle)
+        - Solar activity
+        - Seasonal effects
+        - Geographic location
         
         Args:
             distance_km: Great circle distance
             frequency_mhz: Operating frequency
+            timestamp: Time for ionospheric calculation (default: now)
             
         Returns:
             Estimated propagation delay in milliseconds
         """
-        # Ionospheric reflection height (frequency-dependent)
-        # Lower freq → higher reflection → longer path
-        # Rough model: h = 250 + (20 - freq_mhz) * 5 km
-        if frequency_mhz <= 5:
-            reflection_height_km = 320
-        elif frequency_mhz <= 10:
-            reflection_height_km = 300
-        elif frequency_mhz <= 15:
-            reflection_height_km = 280
-        else:  # 20-25 MHz
-            reflection_height_km = 260
+        if timestamp is None:
+            timestamp = datetime.utcnow()
+        
+        # Get dynamic layer height from ionospheric model
+        # Use midpoint of path for ionospheric calculation
+        try:
+            heights = self._iono_model.get_layer_heights(
+                timestamp=timestamp,
+                latitude=self.receiver_lat,
+                longitude=self.receiver_lon
+            )
+            reflection_height_km = heights.hmF2
+            
+            # Apply frequency-dependent adjustment
+            # Lower frequencies reflect from higher in the layer
+            if frequency_mhz <= 5:
+                reflection_height_km += 20  # F2 layer top
+            elif frequency_mhz <= 10:
+                pass  # Use hmF2 directly
+            elif frequency_mhz <= 15:
+                reflection_height_km -= 20  # Lower in F2
+            else:  # 20-25 MHz
+                reflection_height_km -= 40  # Near F1/F2 boundary
+                
+        except Exception as e:
+            # Fallback to static model if ionospheric model fails
+            logger.debug(f"Ionospheric model fallback: {e}")
+            if frequency_mhz <= 5:
+                reflection_height_km = 320
+            elif frequency_mhz <= 10:
+                reflection_height_km = 300
+            elif frequency_mhz <= 15:
+                reflection_height_km = 280
+            else:
+                reflection_height_km = 260
         
         # Single-hop path length (simplified triangulation)
         # For short distances: essentially straight line at altitude
@@ -555,11 +586,13 @@ class WWVGeographicPredictor:
                     f"expected_diff={expected_diff:.2f}ms)")
         
         # Validate: measured differential should be close to expected
+        # Note: Large discrepancies are common due to ionospheric variability,
+        # multi-hop ambiguity, and simplified model assumptions. Log at DEBUG level.
         if expected_diff > 0:
             diff_error = abs(measured_diff - expected_diff) / expected_diff
             if diff_error > 0.5:  # >50% error
-                logger.warning(f"Measured delay diff ({measured_diff:.2f}ms) differs "
-                              f"significantly from expected ({expected_diff:.2f}ms)")
+                logger.debug(f"Measured delay diff ({measured_diff:.2f}ms) differs "
+                            f"from expected ({expected_diff:.2f}ms) - ionospheric model mismatch")
         
         # Update history with the assigned classifications
         self._update_history(frequency_mhz, early_station, peak_early_delay_ms, peak_early_amplitude)

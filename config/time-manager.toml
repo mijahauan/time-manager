@@ -33,7 +33,7 @@ longitude = -92.127974
 shm_path = "/dev/shm/grape_timing"
 
 # Chrony SHM integration
-enable_chrony = false
+enable_chrony = true
 chrony_unit = 0  # Corresponds to "refclock SHM 0" in chrony.conf
 
 # ZeroMQ publisher (future)
@@ -89,6 +89,20 @@ anomaly_sigma = 3.0
 
 # Force reacquisition after this many consecutive anomalies
 max_consecutive_anomalies = 5
+
+[rtp]
+# RTP multicast settings for ka9q-radio integration
+#
+# Status address for radiod discovery (hostname or IP)
+# If not specified, time-manager will discover available radiod instances on the LAN
+# and prompt for selection at startup
+status_address = "bee1-hf-status.local"
+
+# RTP multicast address (usually auto-discovered from radiod)
+# multicast_address = "239.1.2.82"
+
+# RTP port (default: 5004)
+# port = 5004
 
 [logging]
 # Log level: DEBUG, INFO, WARNING, ERROR

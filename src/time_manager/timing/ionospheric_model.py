@@ -245,19 +245,19 @@ class IonosphericModel:
         if self._iri_available is not None:
             return self._iri_available
         
-        # Try IRI2020 first (preferred, more accurate)
+        # Try iricore first (IRI-2020, preferred)
         try:
-            import iri2020
-            self._iri_module = iri2020
+            import iricore
+            self._iri_module = iricore
             self._iri_available = True
-            logger.info("IRI-2020 model available and functional")
+            logger.info("IRI-2020 model (iricore) available and functional")
             return True
         except ImportError:
             pass
         except Exception as e:
-            logger.debug(f"IRI-2020 failed: {e}")
+            logger.debug(f"iricore failed: {e}")
         
-        # Fall back to IRI2016
+        # Fall back to iri2016
         try:
             import iri2016
             self._iri_module = iri2016
@@ -267,7 +267,7 @@ class IonosphericModel:
         except ImportError:
             self._iri_available = False
             logger.warning(
-                "No IRI model available (pip install iri2020 or iri2016 + gfortran required). "
+                "No IRI model available (pip install iricore or iri2016 + gfortran required). "
                 "Using parametric fallback model."
             )
         except Exception as e:
@@ -304,28 +304,53 @@ class IonosphericModel:
         if cache_key in self._iri_cache:
             self.stats['iri_cache_hits'] += 1
             cached = self._iri_cache[cache_key]
-            # Verify cache not stale
-            age_seconds = (datetime.now(timezone.utc) - cached.timestamp).total_seconds()
+            # Verify cache not stale (handle both tz-aware and tz-naive)
+            now = datetime.now(timezone.utc)
+            cached_ts = cached.timestamp
+            if cached_ts.tzinfo is None:
+                cached_ts = cached_ts.replace(tzinfo=timezone.utc)
+            age_seconds = (now - cached_ts).total_seconds()
             if age_seconds < self._cache_ttl_seconds:
                 return cached
         
         try:
             self.stats['iri_calls'] += 1
             
-            # Call IRI-2016
-            # We only need heights, not full profile, so use minimal altitude range
-            result = self._iri_module.IRI(
-                time=timestamp,
-                altkmrange=(100, 500, 50),  # 100-500 km in 50 km steps
-                glat=latitude,
-                glon=longitude
-            )
+            # Use timestamp from 3 days ago to avoid index availability issues
+            # Solar indices have 2-3 day latency; ionospheric conditions change slowly
+            from datetime import timedelta
+            safe_timestamp = timestamp - timedelta(days=3)
+            # iricore requires timezone-naive datetime
+            if safe_timestamp.tzinfo is not None:
+                safe_timestamp = safe_timestamp.replace(tzinfo=None)
             
-            # Extract peak heights from IRI output
-            # IRI returns hmF2, hmF1, hmE as single values
-            hmF2 = float(result.get('hmF2', DEFAULT_F2_LAYER_HEIGHT_KM))
-            hmF1 = float(result.get('hmF1', DEFAULT_F1_LAYER_HEIGHT_KM))
-            hmE = float(result.get('hmE', DEFAULT_E_LAYER_HEIGHT_KM))
+            # Check which IRI module we have (iricore vs iri2016)
+            if hasattr(self._iri_module, 'iri'):
+                # iricore API (IRI-2020)
+                result = self._iri_module.iri(
+                    dt=safe_timestamp,
+                    altrange=(100, 500, 50),  # 100-500 km in 50 km steps
+                    lat=latitude,
+                    lon=longitude
+                )
+                # iricore returns oarr array with IRI output parameters
+                # oarr indices: 1=hmF2, 2=hmF1 (-1 if not present), 5=hmE
+                oarr = result.oarr
+                hmF2 = float(oarr[1]) if oarr[1] > 0 else DEFAULT_F2_LAYER_HEIGHT_KM
+                hmF1 = float(oarr[2]) if oarr[2] > 0 else DEFAULT_F1_LAYER_HEIGHT_KM
+                hmE = float(oarr[5]) if oarr[5] > 0 else DEFAULT_E_LAYER_HEIGHT_KM
+            else:
+                # iri2016 API
+                result = self._iri_module.IRI(
+                    time=safe_timestamp,
+                    altkmrange=(100, 500, 50),  # 100-500 km in 50 km steps
+                    glat=latitude,
+                    glon=longitude
+                )
+                # Extract peak heights from IRI output
+                hmF2 = float(result.get('hmF2', DEFAULT_F2_LAYER_HEIGHT_KM))
+                hmF1 = float(result.get('hmF1', DEFAULT_F1_LAYER_HEIGHT_KM))
+                hmE = float(result.get('hmE', DEFAULT_E_LAYER_HEIGHT_KM))
             
             # Sanity check on values
             if not (150 < hmF2 < 500):

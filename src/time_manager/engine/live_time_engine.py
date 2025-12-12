@@ -64,6 +64,8 @@ class ChannelState:
     snr_db: float = 0.0
     confidence: float = 0.0
     last_update_minute: int = 0
+    d_clock_raw_ms: float = 0.0        # Raw D_clock for this channel (for web GUI)
+    uncertainty_ms: float = 10.0       # Uncertainty estimate (for web GUI)
     
     def is_valid(self) -> bool:
         """Check if state is valid for Fast Loop use."""
@@ -138,10 +140,11 @@ class FusionResult:
 @dataclass 
 class ChannelBuffer:
     """
-    Per-channel ring buffer and full-minute buffer.
+    Per-channel ring buffer and odd/even minute buffers.
     
     Ring buffer: Keeps ±1.5s around minute boundary for Fast Loop
-    Full buffer: Accumulates entire minute for Slow Loop
+    Odd/Even buffers: 60-second buffers for Slow Loop, each spanning -5s to +55s
+                      around their respective minute boundaries
     """
     channel_name: str
     ssrc: int
@@ -153,12 +156,20 @@ class ChannelBuffer:
     ring_write_pos: int = 0
     ring_start_rtp: int = 0
     
-    # Full minute buffer for Slow Loop (60 seconds = 1,200,000 samples)
-    full_size: int = 1200000
-    full_buffer: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.complex64))
-    full_write_pos: int = 0
-    full_start_rtp: int = 0
-    full_ready: bool = False  # Set when minute is complete
+    # Odd/Even minute buffers for Slow Loop (60 seconds = 1,200,000 samples each)
+    # Each buffer spans from -5s before minute boundary to +55s after
+    # This captures the tone at :00 with 5s pre-roll and 55s of content
+    minute_buffer_size: int = 1200000  # 60 seconds at 20kHz
+    odd_buffer: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.complex64))
+    even_buffer: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.complex64))
+    odd_write_pos: int = 0
+    even_write_pos: int = 0
+    odd_start_rtp: int = 0
+    even_start_rtp: int = 0
+    odd_start_wallclock: float = 0.0
+    even_start_wallclock: float = 0.0
+    odd_minute: int = -1  # Which odd minute this buffer is for
+    even_minute: int = -1  # Which even minute this buffer is for
     
     # RTP tracking
     last_rtp_timestamp: int = 0
@@ -168,14 +179,16 @@ class ChannelBuffer:
     def __post_init__(self):
         """Initialize buffers."""
         self.ring_buffer = np.zeros(self.ring_size, dtype=np.complex64)
-        self.full_buffer = np.zeros(self.full_size, dtype=np.complex64)
+        self.odd_buffer = np.zeros(self.minute_buffer_size, dtype=np.complex64)
+        self.even_buffer = np.zeros(self.minute_buffer_size, dtype=np.complex64)
     
     def add_samples(self, samples: np.ndarray, rtp_timestamp: int, wallclock: float):
         """
         Add samples to buffers.
         
-        Ring buffer: Only keep samples near minute boundary (±1.5s)
-        Full buffer: Accumulate all samples for the minute
+        Ring buffer: Circular, always keeps most recent samples
+        Odd/Even buffers: Fill based on which minute window we're in
+                         Each spans -5s to +65s around its minute boundary
         """
         self.last_rtp_timestamp = rtp_timestamp
         self.last_wallclock = wallclock
@@ -183,34 +196,89 @@ class ChannelBuffer:
         
         n_samples = len(samples)
         
-        # Add to full buffer (always, until full)
-        if self.full_write_pos + n_samples <= self.full_size:
-            # Track start RTP timestamp before first write
-            if self.full_write_pos == 0:
-                self.full_start_rtp = rtp_timestamp
-            
-            self.full_buffer[self.full_write_pos:self.full_write_pos + n_samples] = samples
-            self.full_write_pos += n_samples
+        # Cap samples to buffer sizes to handle large RTP gaps gracefully
+        if n_samples > self.ring_size:
+            logger.warning(f"Dropping {n_samples - self.ring_size} samples (chunk too large for ring buffer)")
+            samples = samples[-self.ring_size:]
+            n_samples = self.ring_size
         
-        # Ring buffer: circular write
-        # Calculate position in ring
+        # Determine which minute buffer to write to based on wallclock
+        # Each buffer spans 70 seconds: from prev:55 through minute:00-59 to next:05
+        # 
+        # Timeline for odd minute N (where N is odd):
+        #   N-1 (even):55 -> N:00 -> N:59 -> N+1 (even):05
+        #   All these samples go to odd_buffer for minute N
+        #
+        # Timeline for even minute M (where M is even):
+        #   M-1 (odd):55 -> M:00 -> M:59 -> M+1 (odd):05
+        #   All these samples go to even_buffer for minute M
+        
+        current_second = wallclock % 60
+        current_minute = int(wallclock) // 60
+        
+        # Determine target minute based on where we are in the 70-second window
+        # Buffer for minute N should contain the tone at N:00
+        # So buffer spans from N-1:55 to N:55 (60 seconds centered on N:00)
+        # 
+        # At N-1:55 to N-1:59: samples go to minute N (pre-roll)
+        # At N:00 to N:54: samples go to minute N (main content with tone)
+        # At N:55 to N:59: samples go to minute N+1 (pre-roll for next)
+        if current_second >= 55:
+            # We're in the last 5 seconds - samples belong to NEXT minute's buffer
+            target_minute = current_minute + 1
+        else:
+            # We're in :00-:54 - samples belong to CURRENT minute's buffer
+            target_minute = current_minute
+        
+        # Route to odd or even buffer based on target minute
+        if target_minute % 2 == 1:
+            # Target is odd minute
+            if self.odd_minute != target_minute:
+                # New odd minute - reset buffer (happens at :55 of even minute)
+                self.odd_write_pos = 0
+                self.odd_start_rtp = 0
+                self.odd_start_wallclock = 0.0
+                self.odd_minute = target_minute
+            self._add_to_odd(samples, rtp_timestamp, wallclock, n_samples)
+        else:
+            # Target is even minute
+            if self.even_minute != target_minute:
+                # New even minute - reset buffer (happens at :55 of odd minute)
+                self.even_write_pos = 0
+                self.even_start_rtp = 0
+                self.even_start_wallclock = 0.0
+                self.even_minute = target_minute
+            self._add_to_even(samples, rtp_timestamp, wallclock, n_samples)
+        
+        # Ring buffer: circular write (always)
         write_start = self.ring_write_pos % self.ring_size
         
         if write_start + n_samples <= self.ring_size:
-            # Simple case: fits without wrap
             self.ring_buffer[write_start:write_start + n_samples] = samples
         else:
-            # Wrap around
             first_part = self.ring_size - write_start
             self.ring_buffer[write_start:] = samples[:first_part]
             self.ring_buffer[:n_samples - first_part] = samples[first_part:]
         
         self.ring_write_pos += n_samples
-        
-        # Track ring buffer start
-        if self.ring_write_pos <= self.ring_size:
-            if self.ring_start_rtp == 0:
-                self.ring_start_rtp = rtp_timestamp
+    
+    def _add_to_odd(self, samples: np.ndarray, rtp_timestamp: int, wallclock: float, n_samples: int):
+        """Add samples to odd minute buffer."""
+        if self.odd_write_pos + n_samples <= self.minute_buffer_size:
+            if self.odd_write_pos == 0:
+                self.odd_start_rtp = rtp_timestamp
+                self.odd_start_wallclock = wallclock
+            self.odd_buffer[self.odd_write_pos:self.odd_write_pos + n_samples] = samples
+            self.odd_write_pos += n_samples
+    
+    def _add_to_even(self, samples: np.ndarray, rtp_timestamp: int, wallclock: float, n_samples: int):
+        """Add samples to even minute buffer."""
+        if self.even_write_pos + n_samples <= self.minute_buffer_size:
+            if self.even_write_pos == 0:
+                self.even_start_rtp = rtp_timestamp
+                self.even_start_wallclock = wallclock
+            self.even_buffer[self.even_write_pos:self.even_write_pos + n_samples] = samples
+            self.even_write_pos += n_samples
     
     def get_ring_samples(self) -> tuple[np.ndarray, int]:
         """
@@ -231,25 +299,38 @@ class ChannelBuffer:
             ])
             return result, self.ring_start_rtp
     
-    def get_full_samples(self) -> tuple[np.ndarray, int]:
+    def get_minute_samples(self, minute: int) -> tuple[np.ndarray, int, float]:
         """
-        Get full minute samples (for Slow Loop).
+        Get samples for a specific minute (for Slow Loop).
         
+        Uses odd/even double-buffering: odd minutes use odd_buffer,
+        even minutes use even_buffer.
+        
+        Args:
+            minute: Unix minute number to retrieve
+            
         Returns:
-            (samples, start_rtp_timestamp)
+            (samples, start_rtp_timestamp, start_wallclock)
         """
-        return self.full_buffer[:self.full_write_pos].copy(), self.full_start_rtp
+        if minute % 2 == 1:
+            # Odd minute
+            if self.odd_minute == minute:
+                return self.odd_buffer[:self.odd_write_pos].copy(), self.odd_start_rtp, self.odd_start_wallclock
+            else:
+                return np.array([], dtype=np.complex64), 0, 0.0
+        else:
+            # Even minute
+            if self.even_minute == minute:
+                return self.even_buffer[:self.even_write_pos].copy(), self.even_start_rtp, self.even_start_wallclock
+            else:
+                return np.array([], dtype=np.complex64), 0, 0.0
     
     def reset_for_new_minute(self):
-        """Reset buffers for new minute."""
-        # Keep ring buffer rolling
-        self.ring_write_pos = 0
-        self.ring_start_rtp = 0
-        
-        # Clear full buffer
-        self.full_write_pos = 0
-        self.full_start_rtp = 0
-        self.full_ready = False
+        """Reset buffers for new minute - NO-OP with double buffering."""
+        # With odd/even double buffering, resets happen automatically
+        # when the buffer switches to a new minute. This method is kept
+        # for API compatibility but does nothing.
+        pass
 
 
 class LiveTimeEngine:
@@ -356,6 +437,24 @@ class LiveTimeEngine:
         
         # Last fusion result
         self.last_fusion: Optional[FusionResult] = None
+        
+        # Clock convergence model (Kalman filter for GPSDO systems)
+        from ..timing.clock_convergence import ClockConvergenceModel
+        self.clock_convergence = ClockConvergenceModel(
+            lock_uncertainty_ms=2.0,
+            min_samples_for_lock=30,
+            anomaly_sigma=3.0,
+            max_consecutive_anomalies=5
+        )
+        
+        # Fusion history for web GUI (Kalman funnel chart)
+        self.fusion_history: deque = deque(maxlen=1440)  # 24 hours at 1/min
+        
+        # Chrony history for web GUI (source comparison chart)
+        self.chrony_history: deque = deque(maxlen=1440)  # 24 hours at 1/min
+        
+        # Callback for fusion updates (used by web server)
+        self.on_fusion_update: Optional[Callable[[FusionResult], None]] = None
         
         # TransmissionTimeSolver for computing per-station propagation delays
         self._propagation_solver = None
@@ -532,6 +631,53 @@ class LiveTimeEngine:
         
         logger.debug(f"Published to SHM: d_clock={solution.d_clock_ms:.2f}ms")
     
+    def _sample_chrony(self):
+        """Sample chrony sources and add to history for web GUI."""
+        import subprocess
+        
+        try:
+            result = subprocess.run(
+                ['chronyc', '-c', 'sources'],
+                capture_output=True, text=True, timeout=5
+            )
+            
+            sources = {}
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                parts = line.split(',')
+                if len(parts) >= 10:
+                    name = parts[2]
+                    offset_s = float(parts[7]) if parts[7] else 0.0
+                    sources[name] = {
+                        'offset_ms': offset_s * 1000,
+                        'state': parts[1],
+                        'stratum': int(parts[3]) if parts[3].isdigit() else 0
+                    }
+            
+            # Extract key sources
+            tmgr = sources.get('TMGR', {}).get('offset_ms')
+            gps = sources.get('192.168.0.134', {}).get('offset_ms')
+            
+            # Find best NTP (excluding local GPS)
+            ntp_sources = {k: v for k, v in sources.items() 
+                          if k not in ('TMGR', '192.168.0.134') and not k.startswith('#')}
+            best_ntp_name = min(ntp_sources.keys(), 
+                               key=lambda k: abs(ntp_sources[k]['offset_ms'])) if ntp_sources else None
+            best_ntp = ntp_sources.get(best_ntp_name, {}).get('offset_ms') if best_ntp_name else None
+            
+            self.chrony_history.append({
+                'timestamp': time.time(),
+                'tmgr_offset_ms': tmgr,
+                'gps_offset_ms': gps,
+                'best_ntp_offset_ms': best_ntp,
+                'best_ntp_name': best_ntp_name,
+                'all_sources': sources
+            })
+            
+        except Exception as e:
+            logger.debug(f"Chrony sampling failed: {e}")
+    
     def _rtp_callback(self, channel_name: str):
         """
         Create RTP callback for a channel.
@@ -576,7 +722,7 @@ class LiveTimeEngine:
         
         return callback
     
-    def _stream_callback(self, channel_name: str):
+    def _stream_callback(self, channel_name: str, channel_info=None):
         """
         Create callback for RadiodStream.
         
@@ -585,30 +731,29 @@ class LiveTimeEngine:
         
         Critical: We must use actual RTP timestamps from radiod, not sample counts.
         RTP timestamps are GPS-disciplined and essential for sub-ms timing.
+        
+        Args:
+            channel_name: Name of the channel
+            channel_info: ChannelInfo (not used - gps_time/rtp_timesnap become stale)
         """
         def callback(samples: np.ndarray, quality):
             if channel_name not in self.channel_buffers:
                 return
             
-            current_time = time.time()
-            
             # Calculate RTP timestamp for this batch from StreamQuality
-            # first_rtp_timestamp + batch_start_sample gives us the actual RTP timestamp
-            # for the start of this sample batch (GPS-disciplined from radiod)
             if hasattr(quality, 'first_rtp_timestamp') and hasattr(quality, 'batch_start_sample'):
                 rtp_timestamp = quality.first_rtp_timestamp + quality.batch_start_sample
             elif hasattr(quality, 'last_rtp_timestamp'):
-                # Fallback: use last_rtp_timestamp - len(samples) 
                 rtp_timestamp = quality.last_rtp_timestamp - len(samples)
             else:
-                # Last resort: use sample count (breaks timing accuracy)
                 rtp_timestamp = getattr(quality, 'total_samples_delivered', 0)
                 logger.warning(f"{channel_name}: No RTP timestamp in StreamQuality, using sample count")
             
-            # Add to buffer with proper RTP timestamp
-            self.channel_buffers[channel_name].add_samples(
-                samples, rtp_timestamp, current_time
-            )
+            # Use GPS-synced system time (NTP disciplined to GPS)
+            wallclock = time.time()
+            
+            # Add to buffer - odd/even double-buffering handles resets automatically
+            self.channel_buffers[channel_name].add_samples(samples, rtp_timestamp, wallclock)
         
         return callback
     
@@ -808,7 +953,8 @@ class LiveTimeEngine:
             ch_info = ch_config['channel_info']
             
             # Create callback that adds samples to our buffer
-            callback = self._stream_callback(name)
+            # Pass channel_info for GPS-accurate wallclock conversion
+            callback = self._stream_callback(name, channel_info=ch_info)
             
             stream = RadiodStream(
                 channel=ch_info,
@@ -914,18 +1060,19 @@ class LiveTimeEngine:
                 
                 detector = self._tone_detectors[name]
                 
-                # FIX Issue 1: Use smoothed RTP-to-System offset (eliminates host jitter)
-                # This is the key to microsecond precision with GPSDO
-                if name in self.rtp_system_offset:
-                    # Use the "steel ruler": RTP time + smoothed offset
-                    buffer_start_time = (start_rtp / self.sample_rate) + self.rtp_system_offset[name]
-                else:
-                    # Fallback to raw wallclock (jittery but safe)
-                    buffer_start_time = buffer.last_wallclock - (len(samples) / self.sample_rate)
+                # Calculate buffer midpoint time for tone detector
+                # The tone detector expects timestamp to be the buffer MIDPOINT
+                # 
+                # Use the wallclock of the last packet as the buffer end time,
+                # then subtract half the buffer duration to get the midpoint.
+                # This ties the detection window to GPS-synced system time.
+                buffer_duration = len(samples) / self.sample_rate
+                buffer_end_time = buffer.last_wallclock
+                buffer_midpoint_time = buffer_end_time - (buffer_duration / 2)
                 
                 # Run tone detection with narrow window (Fast Loop uses previous state)
                 detections = detector.process_samples(
-                    timestamp=buffer_start_time,
+                    timestamp=buffer_midpoint_time,
                     samples=samples,
                     rtp_timestamp=start_rtp,
                     original_sample_rate=self.sample_rate,
@@ -977,7 +1124,7 @@ class LiveTimeEngine:
     
     def _slow_loop(self):
         """
-        Slow Loop thread - runs at T=:02 each minute.
+        Slow Loop thread - runs at T=:06 each minute.
         
         Uses full minute buffer for complete discrimination and
         state update for next Fast Loop iteration.
@@ -986,15 +1133,15 @@ class LiveTimeEngine:
         
         while self.running:
             try:
-                # Wait for second :02 of the minute
+                # Wait for second :06 of the minute (after buffer completes at :05)
                 now = time.time()
                 current_second = now % 60
                 
-                # Calculate time to :02
-                if current_second < 2:
-                    wait_time = 2 - current_second
+                # Calculate time to :06
+                if current_second < 6:
+                    wait_time = 6 - current_second
                 else:
-                    wait_time = 62 - current_second
+                    wait_time = 66 - current_second
                 
                 # Sleep with periodic checks
                 while wait_time > 0 and self.running:
@@ -1018,6 +1165,9 @@ class LiveTimeEngine:
                 # Process Slow Loop
                 self._process_slow_loop(current_minute - 1)  # Process previous minute
                 
+                # Sample chrony sources for history
+                self._sample_chrony()
+                
             except Exception as e:
                 logger.exception(f"Slow Loop error: {e}")
                 time.sleep(1)
@@ -1040,11 +1190,18 @@ class LiveTimeEngine:
             self._phase2_engines = {}
         
         for name, buffer in self.channel_buffers.items():
-            # Get full minute samples
-            samples, start_rtp = buffer.get_full_samples()
+            # Get samples for the requested minute using odd/even double-buffering
+            samples, start_rtp, start_wallclock = buffer.get_minute_samples(minute)
+            
+            # Debug: show buffer state
+            buffer_duration_s = len(samples) / self.sample_rate if len(samples) > 0 else 0
+            if minute % 2 == 1:
+                logger.info(f"  {name}: odd_minute={buffer.odd_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}")
+            else:
+                logger.info(f"  {name}: even_minute={buffer.even_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}")
             
             if len(samples) < self.sample_rate * 30:  # Need at least 30 seconds
-                logger.debug(f"  {name}: Insufficient samples ({len(samples)})")
+                logger.info(f"  {name}: Insufficient samples ({len(samples)}) for minute {minute} (need {self.sample_rate * 30})")
                 buffer.reset_for_new_minute()
                 continue
             
@@ -1073,8 +1230,11 @@ class LiveTimeEngine:
                 
                 engine = self._phase2_engines[name]
                 
-                # Calculate system time for this minute
-                system_time = float(minute * 60)
+                # Use minute boundary as system_time
+                # The buffer spans -5s to +55s around the minute boundary (60 seconds)
+                # Phase 2 adds buffer_duration/2 to get midpoint, so:
+                # system_time = minute_boundary - 5s (buffer starts 5s before)
+                system_time = float(minute * 60) - 5.0
                 
                 # Run full Phase 2 analysis
                 phase2_result = engine.process_minute(
@@ -1116,8 +1276,10 @@ class LiveTimeEngine:
             except Exception as e:
                 logger.warning(f"  {name}: Phase 2 processing failed: {e}")
             
-            # Reset buffer for next minute
-            buffer.reset_for_new_minute()
+            # Don't reset the full buffer here - it needs to keep accumulating
+            # so it contains the minute boundary. The buffer will naturally
+            # overflow and stop accepting new samples, which is fine since
+            # we only need ~60 seconds of data.
         
         # Transition from ACQUIRING to TRACKING
         if self.state == EngineState.ACQUIRING and results:
@@ -1129,9 +1291,40 @@ class LiveTimeEngine:
             fusion_result = self._fuse_broadcasts(results)
             
             if fusion_result:
-                self.d_clock_ms = fusion_result.d_clock_ms
-                self.d_clock_uncertainty_ms = fusion_result.uncertainty_ms
+                # Use Kalman filter for proper clock convergence
+                raw_d_clock = fusion_result.d_clock_ms
+                convergence = self.clock_convergence.process_measurement(
+                    d_clock_ms=raw_d_clock,
+                    timestamp=time.time(),
+                    measurement_noise_ms=fusion_result.uncertainty_ms
+                )
+                
+                # Use Kalman-filtered estimate
+                self.d_clock_ms = convergence.d_clock_ms
+                self.d_clock_uncertainty_ms = convergence.uncertainty_ms
                 self.last_fusion = fusion_result
+                
+                # Log convergence state
+                logger.info(f"  Kalman: raw={raw_d_clock:+.2f}ms → filtered={convergence.d_clock_ms:+.2f}ms "
+                           f"±{convergence.uncertainty_ms:.2f}ms [{convergence.state.value}] "
+                           f"innov={convergence.innovation_ms:+.2f}ms")
+                
+                # Record to fusion history for web GUI
+                self.fusion_history.append({
+                    'timestamp': time.time(),
+                    'd_clock_fused_ms': fusion_result.d_clock_ms,
+                    'd_clock_raw_ms': fusion_result.d_clock_raw_ms,
+                    'uncertainty_ms': fusion_result.uncertainty_ms,
+                    'n_broadcasts': fusion_result.n_broadcasts,
+                    'quality_grade': fusion_result.quality_grade
+                })
+                
+                # Call callback if registered (for web server SSE)
+                if self.on_fusion_update:
+                    try:
+                        self.on_fusion_update(fusion_result)
+                    except Exception as e:
+                        logger.debug(f"Fusion callback error: {e}")
                 
                 logger.info(f"  Slow Loop fused: D_clock={fusion_result.d_clock_ms:+.3f}ms "
                            f"±{fusion_result.uncertainty_ms:.3f}ms from {fusion_result.n_broadcasts} broadcasts "
@@ -1156,7 +1349,10 @@ class LiveTimeEngine:
                 }
             )
             
-            self._publish_shm(solution)
+            try:
+                self._publish_shm(solution)
+            except Exception as e:
+                logger.debug(f"SHM publish failed: {e}")
             
             # Update Chrony if enabled
             if self.enable_chrony and self.chrony_shm:
@@ -1318,13 +1514,10 @@ class LiveTimeEngine:
             
             d_clock_raw = r['d_clock_ms']
             
-            # Apply calibration
-            cal_key = self._get_broadcast_key(station, freq_mhz)
-            cal = self.calibration.get(cal_key)
-            if cal and cal.n_samples > 10:
-                d_clock_calibrated = d_clock_raw + cal.offset_ms
-            else:
-                d_clock_calibrated = d_clock_raw
+            # Use propagation-model-corrected d_clock_ms directly
+            # The model handles frequency-dependent propagation delays
+            # No per-broadcast calibration - let Kalman filter handle smoothing
+            d_clock_calibrated = d_clock_raw
             
             # Calculate weight
             confidence = r.get('confidence', 0.5)
@@ -1349,7 +1542,8 @@ class LiveTimeEngine:
             
             measurements.append((broadcast_key, d_clock_raw, d_clock_calibrated, weight, station, freq_mhz))
             
-            # Update calibration history
+            # Update calibration history (for future use when propagation model is tuned)
+            cal_key = self._get_broadcast_key(station, freq_mhz)
             if cal_key not in self.calibration_history:
                 self.calibration_history[cal_key] = deque(maxlen=self.calibration_history_max)
             self.calibration_history[cal_key].append(d_clock_raw)
@@ -1378,8 +1572,10 @@ class LiveTimeEngine:
             if mad < 0.1:
                 mad = 0.1  # Minimum to avoid division by zero
             
-            # Reject outliers > 3 MAD
-            keep_mask = deviations < (3.0 * mad)
+            # Reject outliers > 2 MAD OR > 10ms from median (hard cap)
+            # The hard cap catches cases where MAD is inflated by multiple outliers
+            mad_threshold = min(2.0 * mad, 10.0)  # At most 10ms deviation allowed
+            keep_mask = deviations < mad_threshold
             
             if np.sum(keep_mask) >= 2:
                 n_rejected = len(measurements) - np.sum(keep_mask)
@@ -1499,7 +1695,7 @@ class LiveTimeEngine:
             offset_sec = self.d_clock_ms / 1000.0
             reference_time = now - offset_sec
             
-            self.chrony_shm.update(reference_time, now, precision=-10)
+            self.chrony_shm.update(reference_time, now, precision=-13)  # ~100µs with GPSDO
             self.stats['chrony_updates'] += 1
             logger.info(f"  Chrony updated: D_clock={self.d_clock_ms:+.2f}ms (update #{self.stats['chrony_updates']})")
         except Exception as e:
@@ -1553,7 +1749,7 @@ class LiveTimeEngine:
         logger.info("LiveTimeEngine started")
         logger.info(f"  State: {self.state.value}")
         logger.info(f"  Fast Loop: waiting for T=:01")
-        logger.info(f"  Slow Loop: waiting for T=:02")
+        logger.info(f"  Slow Loop: waiting for T=:06")
     
     def stop(self):
         """Stop the live time engine."""

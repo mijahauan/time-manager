@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discrimination Analysis - time-manager</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">
+            <span class="nav-logo">&#9201;</span>
+            <span>time-manager</span>
+        </div>
+        <div class="nav-links">
+            <a href="/time" class="nav-link">Time Analysis</a>
+            <a href="/discrimination" class="nav-link active">Discrimination</a>
+        </div>
+        <div class="nav-status">
+            <span id="clock-status" class="status-badge status-unknown">--</span>
+            <span id="d-clock-value">-- ms</span>
+        </div>
+    </nav>
+
+    <main class="container">
+        <!-- Channel Selection -->
+        <section class="section">
+            <div class="section-header">
+                <div class="section-title">WWV/WWVH Discrimination Analysis</div>
+                <div class="section-controls">
+                    <label for="channel-selector">Channel:</label>
+                    <select id="channel-selector" class="control-select">
+                        <option value="">Select channel...</option>
+                    </select>
+                </div>
+            </div>
+        </section>
+
+        <!-- Summary Cards -->
+        <section class="section" id="summary-section" style="display: none;">
+            <div class="section-title" id="channel-title">Channel Summary</div>
+            <div class="status-grid">
+                <div class="status-card">
+                    <div class="status-label">WWV Dominant</div>
+                    <div class="status-value wwv-color" id="summary-wwv-pct">--</div>
+                    <div class="status-unit">of valid minutes</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-label">WWVH Dominant</div>
+                    <div class="status-value wwvh-color" id="summary-wwvh-pct">--</div>
+                    <div class="status-unit">of valid minutes</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-label">Balanced / None</div>
+                    <div class="status-value" id="summary-balanced-pct">--</div>
+                    <div class="status-unit">minutes near parity</div>
+                </div>
+                <div class="status-card">
+                    <div class="status-label">Total Minutes</div>
+                    <div class="status-value" id="summary-total">--</div>
+                    <div class="status-unit">measurements</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Method Legend -->
+        <section class="section" id="method-legend-section" style="display: none;">
+            <div class="section-title">13-Method Weighted Voting</div>
+            <div class="method-grid">
+                <div class="method-card">
+                    <div class="method-name">BCD 100 Hz Correlation</div>
+                    <div class="method-desc">Cross-correlation of 100 Hz BCD tone</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">Tick Timing</div>
+                    <div class="method-desc">Second tick arrival time analysis</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">440 Hz Station ID</div>
+                    <div class="method-desc">WWV min 2, WWVH min 1</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">1000/1200 Hz Tones</div>
+                    <div class="method-desc">Per-minute tone power ratio</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">Test Signal Detection</div>
+                    <div class="method-desc">Scheduled test transmissions</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">Doppler Shift</div>
+                    <div class="method-desc">Carrier frequency offset</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">Propagation Delay</div>
+                    <div class="method-desc">Expected vs measured delay</div>
+                </div>
+                <div class="method-card">
+                    <div class="method-name">Diurnal Pattern</div>
+                    <div class="method-desc">Time-of-day reception probability</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Power Ratio Timeline -->
+        <section class="section" id="charts-section" style="display: none;">
+            <div class="section-title">Power Ratio Timeline (WWV - WWVH)</div>
+            <div class="chart-container">
+                <div id="chart-ratio" class="chart"></div>
+            </div>
+            <div class="chart-description">
+                20·log₁₀(WWV/WWVH) per minute. Green zone = WWV dominant (&gt;3dB), red zone = WWVH dominant (&lt;-3dB).
+                Gray band = balanced (±3dB guard band).
+            </div>
+        </section>
+
+        <!-- BCD Amplitude Chart -->
+        <section class="section" id="bcd-section" style="display: none;">
+            <div class="section-title">BCD 100 Hz Correlation Amplitudes</div>
+            <div class="chart-container">
+                <div id="chart-bcd" class="chart"></div>
+            </div>
+            <div class="chart-description">
+                WWV (green) and WWVH (red) BCD correlation peak amplitudes over time.
+                Higher amplitude indicates stronger station reception.
+            </div>
+        </section>
+
+        <!-- Voting Timeline -->
+        <section class="section" id="voting-section" style="display: none;">
+            <div class="section-title">Weighted Voting Results</div>
+            <div class="charts-row">
+                <div class="chart-container half-width">
+                    <div id="chart-voting" class="chart"></div>
+                </div>
+                <div class="chart-container half-width">
+                    <div id="chart-voting-mix" class="chart"></div>
+                </div>
+            </div>
+            <div class="chart-description">
+                Left: Per-minute dominance result colored by winning station.
+                Right: Overall vote distribution (WWV, WWVH, Balanced, None).
+            </div>
+        </section>
+
+        <!-- Differential Delay -->
+        <section class="section" id="delay-section" style="display: none;">
+            <div class="section-title">Differential Propagation Delay</div>
+            <div class="charts-row">
+                <div class="chart-container half-width">
+                    <div id="chart-delay" class="chart"></div>
+                </div>
+                <div class="chart-container half-width">
+                    <div id="chart-delay-hist" class="chart"></div>
+                </div>
+            </div>
+            <div class="chart-description">
+                Left: WWV - WWVH time-of-arrival difference over time.
+                Right: Histogram of differential delay distribution.
+            </div>
+        </section>
+
+        <!-- No Data Message -->
+        <section class="section" id="no-data-section">
+            <div class="placeholder">
+                <h3>Select a Channel</h3>
+                <p>Choose a channel from the dropdown above to view discrimination analysis.</p>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>Last update: <span id="last-update">--</span></span>
+        <span>time-manager v0.1.0</span>
+    </footer>
+
+    <script src="/static/js/discrimination-charts.js"></script>
+    <script>
+        let currentChannel = null;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            loadChannels();
+            
+            document.getElementById('channel-selector').addEventListener('change', (e) => {
+                currentChannel = e.target.value;
+                if (currentChannel) {
+                    loadDiscriminationData(currentChannel);
+                } else {
+                    hideCharts();
+                }
+            });
+
+            // Auto-refresh every 60 seconds
+            setInterval(() => {
+                if (currentChannel) {
+                    loadDiscriminationData(currentChannel);
+                }
+            }, 60000);
+
+            // Load timing status for navbar
+            loadTimingStatus();
+            setInterval(loadTimingStatus, 30000);
+        });
+
+        async function loadTimingStatus() {
+            try {
+                const response = await fetch('/api/timing');
+                const data = await response.json();
+                
+                const statusBadge = document.getElementById('clock-status');
+                const status = data.clock_status || 'UNKNOWN';
+                statusBadge.textContent = status;
+                statusBadge.className = 'status-badge status-' + status.toLowerCase();
+
+                document.getElementById('d-clock-value').textContent = 
+                    data.d_clock_ms !== undefined ? data.d_clock_ms.toFixed(2) + ' ms' : '-- ms';
+            } catch (error) {
+                console.error('Error loading timing status:', error);
+            }
+        }
+
+        async function loadChannels() {
+            try {
+                const response = await fetch('/api/discrimination');
+                const data = await response.json();
+                
+                const selector = document.getElementById('channel-selector');
+                selector.innerHTML = '<option value="">Select channel...</option>';
+                
+                if (data.channels) {
+                    Object.keys(data.channels).forEach(name => {
+                        const ch = data.channels[name];
+                        const option = document.createElement('option');
+                        option.value = name;
+                        option.textContent = `${name} - ${ch.dominant_station || 'Unknown'} (${ch.measurement_count || 0} measurements)`;
+                        selector.appendChild(option);
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading channels:', error);
+            }
+        }
+
+        function hideCharts() {
+            document.getElementById('summary-section').style.display = 'none';
+            document.getElementById('method-legend-section').style.display = 'none';
+            document.getElementById('charts-section').style.display = 'none';
+            document.getElementById('bcd-section').style.display = 'none';
+            document.getElementById('voting-section').style.display = 'none';
+            document.getElementById('delay-section').style.display = 'none';
+            document.getElementById('no-data-section').style.display = 'block';
+        }
+
+        function showCharts() {
+            document.getElementById('summary-section').style.display = 'block';
+            document.getElementById('method-legend-section').style.display = 'block';
+            document.getElementById('charts-section').style.display = 'block';
+            document.getElementById('bcd-section').style.display = 'block';
+            document.getElementById('voting-section').style.display = 'block';
+            document.getElementById('delay-section').style.display = 'block';
+            document.getElementById('no-data-section').style.display = 'none';
+        }
+
+        async function loadDiscriminationData(channel) {
+            try {
+                const response = await fetch(`/api/discrimination/${encodeURIComponent(channel)}`);
+                const data = await response.json();
+                
+                if (data.error) {
+                    console.error('Error:', data.error);
+                    hideCharts();
+                    return;
+                }
+
+                showCharts();
+                
+                // Update title
+                document.getElementById('channel-title').textContent = `${channel} - Discrimination Summary`;
+                
+                // Update summary cards
+                const summary = data.summary || {};
+                const pct = summary.dominance_pct || {};
+                document.getElementById('summary-wwv-pct').textContent = (pct.wwv || 0).toFixed(1) + '%';
+                document.getElementById('summary-wwvh-pct').textContent = (pct.wwvh || 0).toFixed(1) + '%';
+                document.getElementById('summary-balanced-pct').textContent = (pct.balanced || 0).toFixed(1) + '%';
+                document.getElementById('summary-total').textContent = summary.total_minutes || 0;
+
+                // Render charts
+                const timeline = data.timeline || [];
+                
+                if (timeline.length > 0) {
+                    renderRatioChart(timeline);
+                    renderBcdChart(timeline);
+                    renderVotingChart(timeline);
+                    renderVotingMixChart(summary);
+                    renderDelayChart(timeline);
+                    renderDelayHistogram(timeline);
+                }
+
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                
+            } catch (error) {
+                console.error('Error loading discrimination data:', error);
+                hideCharts();
+            }
+        }
+
+        function renderRatioChart(timeline) {
+            const el = document.getElementById('chart-ratio');
+            if (!el || !timeline.length) return;
+
+            const sorted = [...timeline].sort((a, b) => 
+                new Date(a.timestamp_utc) - new Date(b.timestamp_utc)
+            );
+            
+            const times = sorted.map(t => t.timestamp_utc);
+            const ratios = sorted.map(t => t.power_ratio_db);
+
+            const trace = {
+                x: times,
+                y: ratios,
+                mode: 'markers',
+                marker: {
+                    size: 6,
+                    color: ratios,
+                    colorscale: 'RdYlGn',
+                    cmin: -10,
+                    cmax: 10,
+                    showscale: true,
+                    colorbar: { title: 'dB' }
+                },
+                hovertemplate: 'Ratio: %{y:.1f} dB<br>%{x}<extra></extra>'
+            };
+
+            const layout = {
+                margin: { t: 20, r: 60, b: 50, l: 60 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'rgba(30, 41, 59, 0.5)',
+                xaxis: { 
+                    title: 'Time (UTC)',
+                    type: 'date',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                yaxis: { 
+                    title: 'Power Ratio (dB)',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' },
+                    zeroline: true,
+                    zerolinecolor: '#64748b'
+                },
+                shapes: [
+                    { type: 'rect', x0: times[0], x1: times[times.length-1], y0: 3, y1: 20, 
+                      fillcolor: 'rgba(34, 197, 94, 0.1)', line: { width: 0 }},
+                    { type: 'rect', x0: times[0], x1: times[times.length-1], y0: -20, y1: -3, 
+                      fillcolor: 'rgba(239, 68, 68, 0.1)', line: { width: 0 }},
+                    { type: 'rect', x0: times[0], x1: times[times.length-1], y0: -3, y1: 3, 
+                      fillcolor: 'rgba(148, 163, 184, 0.1)', line: { width: 0 }}
+                ]
+            };
+
+            Plotly.newPlot(el, [trace], layout, { responsive: true, displaylogo: false });
+        }
+
+        function renderBcdChart(timeline) {
+            const el = document.getElementById('chart-bcd');
+            if (!el) return;
+
+            const valid = timeline.filter(t => 
+                t.bcd_wwv_amplitude !== undefined && t.bcd_wwvh_amplitude !== undefined
+            );
+            
+            if (!valid.length) {
+                el.innerHTML = '<p class="no-data">No BCD data available</p>';
+                return;
+            }
+
+            const sorted = [...valid].sort((a, b) => 
+                new Date(a.timestamp_utc) - new Date(b.timestamp_utc)
+            );
+
+            const traces = [
+                {
+                    x: sorted.map(t => t.timestamp_utc),
+                    y: sorted.map(t => t.bcd_wwv_amplitude),
+                    name: 'WWV',
+                    mode: 'lines',
+                    line: { color: '#22c55e', width: 2 }
+                },
+                {
+                    x: sorted.map(t => t.timestamp_utc),
+                    y: sorted.map(t => t.bcd_wwvh_amplitude),
+                    name: 'WWVH',
+                    mode: 'lines',
+                    line: { color: '#ef4444', width: 2 }
+                }
+            ];
+
+            const layout = {
+                margin: { t: 20, r: 20, b: 50, l: 60 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'rgba(30, 41, 59, 0.5)',
+                xaxis: { 
+                    title: 'Time (UTC)',
+                    type: 'date',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                yaxis: { 
+                    title: 'BCD Correlation Amplitude',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                legend: { 
+                    font: { color: '#e0e0e0' },
+                    bgcolor: 'rgba(30, 41, 59, 0.8)'
+                }
+            };
+
+            Plotly.newPlot(el, traces, layout, { responsive: true, displaylogo: false });
+        }
+
+        function renderVotingChart(timeline) {
+            const el = document.getElementById('chart-voting');
+            if (!el || !timeline.length) return;
+
+            const colors = { WWV: '#22c55e', WWVH: '#ef4444', BALANCED: '#8b5cf6', NONE: '#64748b' };
+            const sorted = [...timeline].sort((a, b) => 
+                new Date(a.timestamp_utc) - new Date(b.timestamp_utc)
+            );
+
+            const trace = {
+                x: sorted.map(t => t.timestamp_utc),
+                y: sorted.map(t => {
+                    if (t.dominant_station === 'WWV') return 1;
+                    if (t.dominant_station === 'WWVH') return -1;
+                    return 0;
+                }),
+                mode: 'markers',
+                marker: {
+                    size: 8,
+                    color: sorted.map(t => colors[t.dominant_station] || colors.NONE)
+                },
+                text: sorted.map(t => t.dominant_station || 'NONE'),
+                hovertemplate: '%{x}<br>Winner: %{text}<extra></extra>'
+            };
+
+            const layout = {
+                margin: { t: 20, r: 20, b: 50, l: 60 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'rgba(30, 41, 59, 0.5)',
+                xaxis: { 
+                    title: 'Time (UTC)',
+                    type: 'date',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                yaxis: { 
+                    title: 'Dominant Station',
+                    tickvals: [-1, 0, 1],
+                    ticktext: ['WWVH', 'Balanced', 'WWV'],
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                }
+            };
+
+            Plotly.newPlot(el, [trace], layout, { responsive: true, displaylogo: false });
+        }
+
+        function renderVotingMixChart(summary) {
+            const el = document.getElementById('chart-voting-mix');
+            if (!el) return;
+
+            const labels = ['WWV', 'WWVH', 'Balanced'];
+            const values = [
+                summary.wwv_dominant || 0,
+                summary.wwvh_dominant || 0,
+                summary.balanced || 0
+            ];
+
+            const trace = {
+                type: 'bar',
+                x: labels,
+                y: values,
+                marker: { color: ['#22c55e', '#ef4444', '#8b5cf6'] },
+                hovertemplate: '%{x}: %{y} minutes<extra></extra>'
+            };
+
+            const layout = {
+                margin: { t: 20, r: 20, b: 50, l: 60 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'rgba(30, 41, 59, 0.5)',
+                xaxis: { 
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                yaxis: { 
+                    title: 'Minutes',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                }
+            };
+
+            Plotly.newPlot(el, [trace], layout, { responsive: true, displaylogo: false });
+        }
+
+        function renderDelayChart(timeline) {
+            const el = document.getElementById('chart-delay');
+            if (!el) return;
+
+            const valid = timeline.filter(t => 
+                t.differential_delay_ms !== undefined && t.differential_delay_ms !== null
+            );
+            
+            if (!valid.length) {
+                el.innerHTML = '<p class="no-data">No delay data available</p>';
+                return;
+            }
+
+            const sorted = [...valid].sort((a, b) => 
+                new Date(a.timestamp_utc) - new Date(b.timestamp_utc)
+            );
+
+            const trace = {
+                x: sorted.map(t => t.timestamp_utc),
+                y: sorted.map(t => t.differential_delay_ms),
+                mode: 'markers',
+                marker: {
+                    size: 5,
+                    color: '#3b82f6'
+                },
+                hovertemplate: 'Delay: %{y:.2f} ms<br>%{x}<extra></extra>'
+            };
+
+            const layout = {
+                margin: { t: 20, r: 20, b: 50, l: 60 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'rgba(30, 41, 59, 0.5)',
+                xaxis: { 
+                    title: 'Time (UTC)',
+                    type: 'date',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                yaxis: { 
+                    title: 'Differential Delay (ms)',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                }
+            };
+
+            Plotly.newPlot(el, [trace], layout, { responsive: true, displaylogo: false });
+        }
+
+        function renderDelayHistogram(timeline) {
+            const el = document.getElementById('chart-delay-hist');
+            if (!el) return;
+
+            const delays = timeline
+                .map(t => t.differential_delay_ms)
+                .filter(d => d !== undefined && d !== null && isFinite(d));
+            
+            if (!delays.length) {
+                el.innerHTML = '<p class="no-data">No delay histogram data</p>';
+                return;
+            }
+
+            const trace = {
+                type: 'histogram',
+                x: delays,
+                nbinsx: 30,
+                marker: { color: '#3b82f6' },
+                hovertemplate: '%{x:.1f} ms: %{y} samples<extra></extra>'
+            };
+
+            const layout = {
+                margin: { t: 20, r: 20, b: 50, l: 60 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'rgba(30, 41, 59, 0.5)',
+                xaxis: { 
+                    title: 'Differential Delay (ms)',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                },
+                yaxis: { 
+                    title: 'Count',
+                    gridcolor: '#334155',
+                    tickfont: { color: '#94a3b8' }
+                }
+            };
+
+            Plotly.newPlot(el, [trace], layout, { responsive: true, displaylogo: false });
+        }
+    </script>
+</body>
+</html>

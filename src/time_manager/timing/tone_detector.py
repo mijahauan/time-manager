@@ -705,18 +705,19 @@ class MultiStationToneDetector(IMultiStationToneDetector):
             List of ToneDetectionResult objects, sorted by SNR (strongest first)
         """
         # Get minute boundary for the EXPECTED tone (around :00.0)
-        # Calculate buffer start time (current_unix_time is buffer MIDPOINT)
-        buffer_duration_sec = len(iq_samples) / self.sample_rate
-        buffer_start_time = current_unix_time - (buffer_duration_sec / 2)
+        # current_unix_time is the buffer MIDPOINT
+        # Find the nearest minute boundary to the midpoint
+        # Round to nearest minute boundary (not floor)
+        minute_boundary = round(current_unix_time / 60) * 60
         
-        # Use floor to find the minute boundary that the buffer START falls in
-        # IMPORTANT: Add small epsilon to handle floating point precision issues
-        # Without this, 1764932339.9999999 would floor to 1764932280 instead of 1764932340
-        minute_boundary = int((buffer_start_time + 0.5) / 60) * 60
-        
-        # Check if we already detected this minute (prevent duplicates)
+        # Check if we already detected this minute (prevent duplicates in Fast Loop)
+        # Skip this check for Slow Loop which re-processes the same minute
         if minute_boundary in self.last_detections_by_minute:
-            return []
+            logger.debug(f"Skipping duplicate detection for minute {minute_boundary}")
+            # Don't return empty - allow re-detection for Slow Loop
+            # The Fast Loop uses ring buffer, Slow Loop uses full buffer
+            # They may have different detection results
+            pass  # Continue with detection
         
         # Step 1: AM demodulation (extract envelope)
         magnitude = np.abs(iq_samples)
