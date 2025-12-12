@@ -395,12 +395,37 @@ class WWVHDiscriminator:
         # Keep last 1000 measurements
         self.max_history = 1000
         
-        # Initialize BCD encoder for template generation
-        self.bcd_encoder = WWVBCDEncoder(sample_rate=sample_rate)
+        # Determine channel frequency and whether discrimination is needed
+        self.frequency_mhz = self._extract_frequency_mhz(channel_name)
+        
+        # Shared frequencies where both WWV and WWVH broadcast
+        SHARED_FREQUENCIES = {2.5, 5.0, 10.0, 15.0}
+        # CHU-only frequencies
+        CHU_FREQUENCIES = {3.33, 7.85, 14.67}
+        # WWV-only frequencies (no WWVH)
+        WWV_ONLY_FREQUENCIES = {20.0, 25.0}
+        
+        self.is_shared_frequency = self.frequency_mhz in SHARED_FREQUENCIES
+        self.is_chu_frequency = self.frequency_mhz in CHU_FREQUENCIES
+        self.is_wwv_only_frequency = self.frequency_mhz in WWV_ONLY_FREQUENCIES
+        self.needs_discrimination = self.is_shared_frequency  # Only shared freqs need WWV/WWVH discrimination
+        
+        if not self.needs_discrimination:
+            if self.is_chu_frequency:
+                logger.info(f"{channel_name}: Discrimination disabled (CHU-only frequency)")
+            elif self.is_wwv_only_frequency:
+                logger.info(f"{channel_name}: Discrimination disabled (WWV-only frequency, no WWVH)")
+        
+        # Initialize BCD encoder for template generation (only for shared frequencies)
+        self.bcd_encoder = WWVBCDEncoder(sample_rate=sample_rate) if self.needs_discrimination else None
         
         # Initialize test signal detector for minute 8/44 discrimination
-        self.test_signal_detector = WWVTestSignalDetector(sample_rate=sample_rate)
-        logger.info(f"{channel_name}: Test signal detector initialized for minutes 8/44 @ {sample_rate} Hz")
+        # Test signal is useful for ionospheric characterization on all WWV/WWVH frequencies
+        if not self.is_chu_frequency:
+            self.test_signal_detector = WWVTestSignalDetector(sample_rate=sample_rate)
+            logger.info(f"{channel_name}: Test signal detector initialized for minutes 8/44 @ {sample_rate} Hz")
+        else:
+            self.test_signal_detector = None
         
         # Initialize geographic predictor if grid square provided
         self.geo_predictor: Optional[WWVGeographicPredictor] = None
@@ -421,6 +446,14 @@ class WWVHDiscriminator:
             logger.info(f"{channel_name}: Geographic ToA prediction disabled (no grid square configured)")
         
         logger.info(f"{channel_name}: WWVHDiscriminator initialized")
+    
+    def _extract_frequency_mhz(self, channel_name: str) -> float:
+        """Extract frequency in MHz from channel name like 'WWV 10 MHz' or 'CHU 7.85 MHz'."""
+        import re
+        match = re.search(r'(\d+\.?\d*)\s*MHz', channel_name, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+        return 0.0
     
     def measure_tone_powers_fft(
         self,
@@ -1907,10 +1940,7 @@ class WWVHDiscriminator:
             wwv_snr_db = 10 * np.log10(wwv_power / noise_power) if noise_power > 0 else -100
             wwvh_snr_db = 10 * np.log10(wwvh_power / noise_power) if noise_power > 0 else -100
             
-            # Debug: Print first tick's SNR values to stderr
-            if second == 1:
-                import sys
-                print(f"DEBUG {self.channel_name}: Phase SNR: WWV={wwv_snr_db:.1f}dB, WWVH={wwvh_snr_db:.1f}dB (threshold={snr_threshold_db}dB)", file=sys.stderr)
+            # Debug logging removed - was printing misleading WWV/WWVH SNR on non-shared frequencies
             
             # Extract phase (only if SNR is sufficient for reliable measurement)
             wwv_phase = np.angle(wwv_complex)
@@ -1984,6 +2014,11 @@ class WWVHDiscriminator:
                 - instantaneous_doppler: List of per-second Doppler measurements
             Returns None if insufficient high-SNR ticks available
         """
+        # Skip Doppler estimation on non-shared frequencies (no WWVH to compare)
+        if not self.needs_discrimination:
+            logger.debug(f"{self.channel_name}: Skipping Doppler estimation (not a shared frequency)")
+            return None
+        
         # Extract per-tick phases
         tick_data = self.extract_per_tick_phases(iq_samples, sample_rate, snr_threshold_db)
         
@@ -2864,6 +2899,14 @@ class WWVHDiscriminator:
         Returns:
             Tuple of (wwv_amp_mean, wwvh_amp_mean, delay_mean, quality_mean, windows_list)
         """
+        # Skip BCD discrimination on non-shared frequencies
+        if not self.needs_discrimination:
+            logger.debug(f"{self.channel_name}: Skipping BCD discrimination (not a shared frequency)")
+            return None, None, None, None, []
+        
+        if self.bcd_encoder is None:
+            return None, None, None, None, []
+        
         # 1. Determine Window Size (T_int)
         # Default to 10 seconds - within typical HF coherence time (Tc ~10-20s)
         # This prevents Doppler-induced phase rotation from destroying correlation

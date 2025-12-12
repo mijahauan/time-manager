@@ -6,8 +6,9 @@ Primary Instruction:  In this context you will perform a critical review of the 
 
 ## Session Focus: Convergence Methodology Issues
 
-The LiveTimeEngine has been debugged to the point where both Fast Loop and Slow Loop
-are producing valid D_clock measurements, but convergence remains problematic.
+The LiveTimeEngine has been debugged through major infrastructure issues (radiod channel
+management, payload encoding enforcement, buffer timing, and fusion robustness), but
+convergence to UTC(NIST) remains problematic.
 
 ### What's Working
 
@@ -27,29 +28,45 @@ are producing valid D_clock measurements, but convergence remains problematic.
    - Samples at :00-:54 → current minute's buffer (contains tone at :00)
    - `system_time = (minute * 60) - 5.0` correctly represents buffer start
 
+4. **Radiod channel management + payload encoding** (fixed 2025-12-12):
+   - ka9q-python pinned to 3.2.1
+   - Channels are managed by signature (frequency, sample rate, preset, destination)
+   - Payload encoding is forced to float32 by setting `OUTPUT_ENCODING=Encoding.F32` via `RadiodControl.tune()`
+
+5. **Fusion robustness** (fixed 2025-12-12):
+   - Absurd persisted per-broadcast calibration offsets are clamped/ignored
+   - Fusion diagnostics print raw/cal/calibrated values when grade is D or uncertainty is large
+
 ### Current Problems to Investigate
 
-1. **Intermittent `observed=0.00ms`**: Some channels in the Slow Loop still produce
-   `observed=0.00ms` which causes 55-second D_clock offsets. This happens even when
-   the Fast Loop detects tones on the same channel. Possible causes:
-   - Phase 2 tone detector not finding tone (different search parameters?)
-   - Buffer timing still off for some edge cases
-   - Sample gaps or discontinuities in the buffer
+1. **Seconds-scale basin errors (`~ -5000ms` and `~ -55000ms`)**: Slow Loop solutions
+   still occasionally land in catastrophic basins even with float32 IQ and full-minute
+   buffers. Recent logs show Phase2 producing ~-5000ms class D_clock while other
+   channels produce tens-of-ms. Fusion then gates (grade D) and/or is pulled.
+   Hypotheses to validate:
+   - Phase2 minute/second anchoring mismatch (wrong interpretation of `system_time` vs buffer start)
+   - Tone-miss fallback behavior that returns `observed=0.00ms` leading to quantized offsets
+   - Mixed station discrimination failure on shared frequencies leading to wrong station timebase
 
-2. **Kalman Filter Corruption**: When bad measurements (55s offset) are fed to the
-   Kalman filter, it takes a long time to recover. The innovation values are huge
-   (e.g., `innov=+41806.93ms`). Consider:
-   - Pre-filtering measurements before Kalman (reject >1 second offsets?)
-   - Kalman reset logic when innovation exceeds threshold
-   - Separate Kalman instances for Fast vs Slow Loop
+2. **Kalman funnel not re-establishing**: Fusion frequently yields grade D and is gated,
+   preventing stable convergence. Even when uncertainty is small, grade D gating blocks
+   updates. Consider:
+   - Update gating should be based on station count + uncertainty, not grade alone
+   - Hard reject seconds-scale candidates before fusion/Kalman
+   - Explicit Kalman reset/reseed when innovation exceeds threshold
 
-3. **MAD Outlier Rejection Ineffective**: The MAD-based outlier rejection doesn't
-   work well when there's a mix of good (+10ms) and bad (+55000ms) measurements.
-   The MAD becomes huge, so nothing gets rejected.
+3. **Outlier rejection strategy**: MAD can fail in bimodal distributions (good vs catastrophic).
+   Current prefilter of ±100ms is correct for raw D_clock, but we must ensure no later stage
+   (calibration, station mapping, minute anchoring) can reintroduce seconds-scale error.
 
-4. **Fast Loop vs Slow Loop Discrepancy**: Fast Loop produces consistent +8-12ms
-   values, but Slow Loop produces a wider range (+10-33ms) with some 55s outliers.
-   Why the difference? Both should be measuring the same clock offset.
+4. **Fast Loop vs Slow Loop discrepancy**: Fast Loop can appear plausible while Slow Loop
+   lands in a wrong basin. Both should measure the same D_clock; investigate differences in:
+   - tone detector search windows/assumptions
+   - minute boundary anchoring
+   - station discrimination inputs and how they feed the solver
+
+5. **Calibration clamping**: Fusion robustness fixes have introduced calibration clamping,
+   but we need to ensure this doesn't mask underlying issues.
 
 ### Key Files to Review
 
@@ -73,17 +90,17 @@ are producing valid D_clock measurements, but convergence remains problematic.
 
 ### Specific Questions
 
-1. Why does the Slow Loop Phase 2 tone detector sometimes fail to find tones that
-   the Fast Loop successfully detects on the same channel?
+1. Why does Phase2 sometimes converge to a ~-5000ms basin even when tone detection
+   claims success and buffers are full-length?
 
-2. Is the `system_time = (minute * 60) - 5.0` calculation correct for all cases,
-   or are there edge cases where the buffer doesn't actually start at :55?
+2. Are `system_time`, `start_wallclock`, and the minute boundary calculation consistent
+   across Fast Loop, Slow Loop, and Phase2? If not, where is the mismatch introduced?
 
-3. Should the Kalman filter have a "reset" mechanism when innovation exceeds a
-   threshold (e.g., >1 second)?
+3. Should we explicitly block seconds-scale candidates before fusion/Kalman and implement
+   a hard reset/reseed of convergence state when innovation exceeds a threshold?
 
-4. Is there a race condition between buffer filling and buffer reading that could
-   cause incomplete or corrupted data?
+4. When Phase2 returns `observed=0.00ms`, is that an explicit failure path that should
+   set confidence to ~0 and be rejected before it becomes a D_clock candidate?
 
-5. The Fast Loop uses `buffer.last_wallclock` for timing while Slow Loop uses
-   a calculated `system_time`. Should they use the same approach?
+5. Why do logs frequently show `start_rtp_wallclock=0.0`? Is radiod timing metadata not
+   present in ChannelInfo, or are we not propagating it into the processing path?

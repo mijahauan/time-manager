@@ -438,7 +438,7 @@ class TransmissionTimeSolver:
             )
             # Initialize ionospheric delay calculator (Issue 1.3 fix)
             self.delay_calculator = IonosphericDelayCalculator(iono_model=self.iono_model)
-            logger.info("Dynamic ionospheric model enabled (IRI-2016 + calibration + 1/f² delay)")
+            logger.info("Dynamic ionospheric model enabled (IRI + calibration + 1/f² delay)")
         else:
             self.iono_model = None
             self.delay_calculator = None

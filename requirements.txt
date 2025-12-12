@@ -8,6 +8,7 @@
 numpy>=1.20.0
 scipy>=1.7.0
 toml>=0.10.0
+ka9q-python==3.2.1
 
 # Chrony SHM integration (required for chrony output)
 sysv_ipc>=1.1.0

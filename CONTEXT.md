@@ -35,6 +35,20 @@ relative to UTC(NIST) with sub-millisecond precision.
 - ✅ Health monitoring HTTP server (Prometheus metrics)
 - ✅ 30 unit tests passing
 
+### What Was Recently Fixed (Dec 2025)
+- ✅ **ka9q-python pinned to 3.2.1** (PyPI) to stabilize API behavior
+- ✅ **Radiod float32 enforcement**: channels are forced to use `OUTPUT_ENCODING=F32` via `RadiodControl.tune(..., encoding=Encoding.F32)`
+- ✅ **Channel identity is signature-based** (frequency, sample rate, preset, destination) to avoid hijacking other clients
+- ✅ **RTP discontinuity handling**: large discontinuities reset; moderate gaps are filled/treated as gaps
+- ✅ **Slow Loop minute buffering**: require ~55s+ of samples before processing to avoid partial-minute artifacts
+- ✅ **Calibration safety rails**: discard/ignore absurd persisted calibration offsets and prevent learning extreme offsets
+
+### Current Blockers (Convergence / Kalman Funnel)
+- ❌ **Seconds-scale basin errors** still appear in Slow Loop solutions (commonly ~-5000ms and sometimes ~-55000ms class behavior)
+- ❌ **Fusion frequently gates updates** (grade D / too few valid broadcasts), preventing stable convergence to UTC(NIST)
+- ❌ **Intermittent `observed=0.00ms` / tone-miss fallbacks** in Phase2 still occur and can produce catastrophic offsets
+- ❌ **RTP→UTC anchoring visibility**: logs often show `start_rtp_wallclock=0.0`, suggesting missing timing metadata in some paths
+
 ### What's Missing / TODO
 - ❌ **Discrimination web page** - needs migration from grape-recorder
 - ❌ **Time status web page** - needs migration from grape-recorder
@@ -280,6 +294,9 @@ Key fixes applied in the December 2025 code review:
 4. **Path references**: All updated from grape-recorder to time-manager
 5. **Health server**: Added with Prometheus metrics support
 6. **Test suite**: 30 tests covering critical modules
+7. **Radiod float32 encoding enforcement**: Force `Encoding.F32` on all time-manager channels
+8. **Channel management**: Signature + destination-based selection; delayed verification after create/reconfigure
+9. **Fusion robustness**: Clamp invalid per-broadcast calibration offsets; improved fusion diagnostics for gated cases
 
 See `CHANGELOG.md` for full details.
 

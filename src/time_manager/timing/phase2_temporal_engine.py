@@ -1150,7 +1150,15 @@ class Phase2TemporalEngine:
         #
         # The expected_second_rtp is where the tone WOULD arrive if clock were perfect.
         # Calculate from system_time (buffer start) to minute boundary:
-        minute_boundary = (int(system_time) // 60) * 60
+        #
+        # CRITICAL FIX (2025-12-11): The buffer starts at :55 of the PREVIOUS minute,
+        # but contains the tone at :00 of the TARGET minute. We need to find the
+        # minute boundary that's ~5 seconds INTO the buffer, not before it.
+        #
+        # Use round() on buffer midpoint to get the correct minute:
+        buffer_duration = 60.0  # 60-second buffer
+        buffer_mid_time = system_time + buffer_duration / 2
+        minute_boundary = round(buffer_mid_time / 60) * 60
         samples_to_boundary = int((minute_boundary - system_time) * self.sample_rate)
         expected_second_rtp = rtp_timestamp + samples_to_boundary
         
@@ -1426,8 +1434,13 @@ class Phase2TemporalEngine:
             or None if analysis fails completely
         """
         # Calculate minute boundary
-        minute_boundary = (int(system_time) // 60) * 60
-        minute_number = int((system_time // 60) % 60)
+        # In live mode, buffers typically start at :55 (5s pre-roll) and contain
+        # the tone at :00 of the *target* minute.
+        # If we compute the minute boundary from the raw buffer start time,
+        # we will anchor to the previous minute and introduce a ~5s error.
+        minute_anchor_time = system_time + 5.0
+        minute_boundary = (int(minute_anchor_time) // 60) * 60
+        minute_number = int((minute_anchor_time // 60) % 60)
         
         # Validate and normalize input
         iq_samples, validation_metrics = self._validate_input(iq_samples)

@@ -130,6 +130,8 @@ class FusionResult:
     n_broadcasts: int              # Number contributing
     n_outliers_rejected: int       # Outliers removed
     quality_grade: str             # A/B/C/D
+    n_total_candidates: int = 0
+    n_prefilter_rejected: int = 0
     
     # Per-station breakdown
     wwv_count: int = 0
@@ -403,6 +405,12 @@ class LiveTimeEngine:
         # This is the key to using GPSDO as a "steel ruler"
         self.rtp_system_offset: Dict[str, float] = {}  # Per-channel smoothed offset
         self.rtp_offset_alpha = 0.05  # EMA smoothing factor (slow adaptation)
+
+        # Track RTP continuity per channel (start timestamps in samples)
+        self._last_rtp_end: Dict[str, int] = {}
+
+        # Non-finite IQ sample tracking (rate-limit warnings)
+        self._nonfinite_log_state: Dict[str, Dict[str, float]] = {}
         
         # RTP receiver (will be initialized on start)
         self.rtp_receiver = None
@@ -575,19 +583,30 @@ class LiveTimeEngine:
             try:
                 with open(self.calibration_file, 'r') as f:
                     data = json.load(f)
+
+                max_abs_offset_ms = 500.0
                 
                 for broadcast_key, cal_data in data.items():
                     # Parse station and frequency from key
                     parts = broadcast_key.rsplit('_', 1)
                     station = parts[0] if len(parts) > 1 else broadcast_key
                     freq = float(parts[1]) if len(parts) > 1 else 0.0
+
+                    offset_ms = float(cal_data.get('offset_ms', 0.0))
+                    n_samples = int(cal_data.get('n_samples', 0) or 0)
+                    if abs(offset_ms) > max_abs_offset_ms:
+                        logger.warning(
+                            f"Discarding invalid calibration {broadcast_key}: offset_ms={offset_ms:+.3f}ms"
+                        )
+                        offset_ms = 0.0
+                        n_samples = 0
                     
                     self.calibration[broadcast_key] = BroadcastCalibration(
                         station=station,
                         frequency_mhz=cal_data.get('frequency_mhz', freq),
-                        offset_ms=cal_data.get('offset_ms', 0.0),
+                        offset_ms=offset_ms,
                         uncertainty_ms=cal_data.get('uncertainty_ms', 10.0),
-                        n_samples=cal_data.get('n_samples', 0),
+                        n_samples=n_samples,
                         last_updated=cal_data.get('last_updated', 0.0)
                     )
                 
@@ -690,6 +709,11 @@ class LiveTimeEngine:
             
             # Convert payload to complex64 samples
             samples = np.frombuffer(payload, dtype=np.complex64)
+
+            if not np.isfinite(samples).all():
+                bad = int(np.size(samples) - np.count_nonzero(np.isfinite(samples)))
+                logger.warning(f"{channel_name}: Non-finite IQ samples in RTP payload (bad={bad}/{len(samples)})")
+                samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
             
             # FIX Issue 2: Safe wallclock handling
             # Never estimate absolute time from raw RTP without a known anchor
@@ -714,14 +738,14 @@ class LiveTimeEngine:
                 else:
                     # Initialize with first observation
                     self.rtp_system_offset[channel_name] = instant_offset
-            
+
             # Add to buffer
             self.channel_buffers[channel_name].add_samples(
                 samples, header.timestamp, wc
             )
-        
+            
         return callback
-    
+
     def _stream_callback(self, channel_name: str, channel_info=None):
         """
         Create callback for RadiodStream.
@@ -739,7 +763,53 @@ class LiveTimeEngine:
         def callback(samples: np.ndarray, quality):
             if channel_name not in self.channel_buffers:
                 return
-            
+
+            if not np.isfinite(samples).all():
+                bad = int(np.size(samples) - np.count_nonzero(np.isfinite(samples)))
+                bad_frac = (bad / float(np.size(samples))) if np.size(samples) else 0.0
+                now = time.time()
+                state = self._nonfinite_log_state.get(channel_name)
+                if state is None:
+                    state = {'last_log': 0.0, 'suppressed': 0.0, 'diag_logged': 0.0}
+                    self._nonfinite_log_state[channel_name] = state
+
+                # One-time diagnostics per channel to help identify upstream encoding/preset issues
+                if float(state.get('diag_logged', 0.0)) == 0.0:
+                    try:
+                        finite = samples[np.isfinite(samples)]
+                        abs_finite = np.abs(finite) if finite.size else np.array([], dtype=np.float64)
+                        abs_min = float(np.min(abs_finite)) if abs_finite.size else 0.0
+                        abs_max = float(np.max(abs_finite)) if abs_finite.size else 0.0
+                    except Exception:
+                        abs_min, abs_max = 0.0, 0.0
+
+                    logger.warning(
+                        f"{channel_name}: Non-finite IQ diagnostics: dtype={getattr(samples, 'dtype', None)}, "
+                        f"shape={getattr(samples, 'shape', None)}, bad={bad}/{np.size(samples)} ({bad_frac*100:.1f}%), "
+                        f"|x| range≈[{abs_min:.3g}, {abs_max:.3g}]"
+                    )
+                    state['diag_logged'] = 1.0
+
+                # Rate-limit to at most once per 5 seconds per channel
+                if now - float(state['last_log']) >= 5.0:
+                    suppressed = int(state.get('suppressed', 0.0))
+                    extra = f" (+{suppressed} suppressed)" if suppressed > 0 else ""
+                    logger.warning(
+                        f"{channel_name}: Non-finite IQ samples in stream batch "
+                        f"(bad={bad}/{len(samples)}={bad_frac*100:.1f}%){extra}"
+                    )
+                    state['last_log'] = now
+                    state['suppressed'] = 0.0
+                else:
+                    state['suppressed'] = float(state.get('suppressed', 0.0)) + 1.0
+
+                # Treat corruption as a "gap" rather than mixing partially-corrupt samples.
+                # This preserves downstream DSP assumptions and matches the resequencer philosophy.
+                if bad_frac >= 0.05:
+                    samples = np.zeros_like(samples)
+                else:
+                    samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Calculate RTP timestamp for this batch from StreamQuality
             if hasattr(quality, 'first_rtp_timestamp') and hasattr(quality, 'batch_start_sample'):
                 rtp_timestamp = quality.first_rtp_timestamp + quality.batch_start_sample
@@ -748,13 +818,104 @@ class LiveTimeEngine:
             else:
                 rtp_timestamp = getattr(quality, 'total_samples_delivered', 0)
                 logger.warning(f"{channel_name}: No RTP timestamp in StreamQuality, using sample count")
-            
-            # Use GPS-synced system time (NTP disciplined to GPS)
-            wallclock = time.time()
-            
+
+            # Detect discontinuities: ka9q resequencer can skip ahead on packet loss.
+            # Any significant gap will corrupt minute buffers and produce large D_clock errors.
+            prev_end = self._last_rtp_end.get(channel_name)
+            if prev_end is not None:
+                gap_samples = int(rtp_timestamp - prev_end)
+                # Match grape-recorder resequencer behavior:
+                # - Fill smaller forward gaps with zeros to preserve sample-count integrity
+                # - Treat very large jumps as discontinuities (radiod restart / channel recreation)
+                DISCONTINUITY_THRESHOLD_SAMPLES = 200_000  # 10 seconds at 20 kHz
+                MAX_GAP_FILL_SAMPLES = 200_000             # Fill up to 10 seconds with zeros
+
+                if abs(gap_samples) > DISCONTINUITY_THRESHOLD_SAMPLES:
+                    gap_ms = (gap_samples / self.sample_rate) * 1000.0
+                    logger.warning(
+                        f"{channel_name}: RTP discontinuity detected (gap={gap_samples} samples, {gap_ms:+.1f}ms) "
+                        f"- resetting minute buffers"
+                    )
+                    buf = self.channel_buffers.get(channel_name)
+                    if buf is not None:
+                        buf.reset_for_new_minute()
+
+                    # Drop this batch: it is not contiguous with the previous data.
+                    self._last_rtp_end.pop(channel_name, None)
+                    return
+
+                if gap_samples > 0:
+                    # Forward gap: fill with zeros to keep RTP sample timeline continuous.
+                    if gap_samples <= MAX_GAP_FILL_SAMPLES:
+                        gap_ms = (gap_samples / self.sample_rate) * 1000.0
+                        logger.warning(
+                            f"{channel_name}: RTP gap fill (gap={gap_samples} samples, {gap_ms:.1f}ms)"
+                        )
+                        zeros = np.zeros(gap_samples, dtype=np.complex64)
+                        samples = np.concatenate([zeros, samples])
+                        rtp_timestamp = int(prev_end)
+                    else:
+                        gap_ms = (gap_samples / self.sample_rate) * 1000.0
+                        logger.warning(
+                            f"{channel_name}: RTP gap too large to fill (gap={gap_samples} samples, {gap_ms:.1f}ms) "
+                            f"- resetting minute buffers"
+                        )
+                        buf = self.channel_buffers.get(channel_name)
+                        if buf is not None:
+                            buf.reset_for_new_minute()
+                        self._last_rtp_end.pop(channel_name, None)
+                        return
+                elif gap_samples < 0:
+                    # Backward jump (out-of-order or restart): treat as discontinuity.
+                    gap_ms = (gap_samples / self.sample_rate) * 1000.0
+                    logger.warning(
+                        f"{channel_name}: RTP backward jump detected (gap={gap_samples} samples, {gap_ms:+.1f}ms) "
+                        f"- resetting minute buffers"
+                    )
+                    buf = self.channel_buffers.get(channel_name)
+                    if buf is not None:
+                        buf.reset_for_new_minute()
+                    self._last_rtp_end.pop(channel_name, None)
+                    return
+
+            # Maintain smoothed RTP->System offset in RadiodStream mode.
+            # We don't get an explicit wallclock from the stream, so use local wallclock
+            # and rely on slow EMA smoothing to reject host jitter.
+            wc = None
+            for attr in ('wallclock', 'wallclock_time', 'system_time', 'timestamp'):
+                if hasattr(quality, attr):
+                    try:
+                        wc = float(getattr(quality, attr))
+                        break
+                    except Exception:
+                        wc = None
+            if wc is None:
+                wc = time.time()
+
+            rtp_time = rtp_timestamp / self.sample_rate
+            instant_offset = wc - rtp_time
+            if channel_name in self.rtp_system_offset:
+                old_offset = self.rtp_system_offset[channel_name]
+                self.rtp_system_offset[channel_name] = (
+                    (1 - self.rtp_offset_alpha) * old_offset +
+                    self.rtp_offset_alpha * instant_offset
+                )
+            else:
+                self.rtp_system_offset[channel_name] = instant_offset
+                logger.info(f"{channel_name}: Initialized RTP→wallclock offset = {instant_offset:.6f}s")
+
+            # Feed the buffer a consistent wallclock derived from RTP sequencing.
+            # ChannelBuffer uses wallclock%60 to decide which minute buffer to fill.
+            # Using time.time() here reintroduces per-channel scheduling jitter and
+            # can cause buffers to be "too early" or "too late" by tens of seconds.
+            wallclock_for_buffer = (rtp_timestamp / self.sample_rate) + self.rtp_system_offset.get(channel_name, instant_offset)
+
             # Add to buffer - odd/even double-buffering handles resets automatically
-            self.channel_buffers[channel_name].add_samples(samples, rtp_timestamp, wallclock)
-        
+            self.channel_buffers[channel_name].add_samples(samples, rtp_timestamp, wallclock_for_buffer)
+
+            # Update continuity tracker
+            self._last_rtp_end[channel_name] = int(rtp_timestamp + len(samples))
+
         return callback
     
     def _discover_channels(self, status_address: str = "radiod.local") -> List[Dict[str, Any]]:
@@ -827,7 +988,7 @@ class LiveTimeEngine:
         Uses RadiodControl to create/configure channels if needed.
         """
         from ka9q import (
-            discover_channels, RadiodStream, RadiodControl, allocate_ssrc
+            discover_channels, RadiodStream, RadiodControl, allocate_ssrc, Encoding
         )
         import hashlib
         
@@ -850,6 +1011,11 @@ class LiveTimeEngine:
             'agc': 0,
             'gain': 0.0,
         }
+
+        # Identity/signature fields (SSRC is treated as an internal handle only)
+        desired_preset = CHANNEL_DEFAULTS['preset']
+        desired_sample_rate = int(CHANNEL_DEFAULTS['sample_rate'])
+        desired_encoding = Encoding.F32
         
         # Generate our destination multicast (deterministic from station/instrument ID)
         def generate_multicast_ip(station_id: str, instrument_id: str) -> str:
@@ -864,11 +1030,37 @@ class LiveTimeEngine:
         logger.info(f"  Discovering channels from {self.status_address}...")
         discovered = discover_channels(self.status_address, listen_duration=2.0)
         
-        # Build frequency -> ChannelInfo lookup
-        freq_to_channel = {}
-        for ssrc, ch_info in discovered.items():
-            freq_hz = int(round(ch_info.frequency))
-            freq_to_channel[freq_hz] = ch_info
+        # Build signature -> ChannelInfo lookup (SSRC is not identity)
+        # Signature = (frequency_hz, sample_rate, preset, destination)
+        sig_to_channel = {}
+        for _ssrc, ch_info in discovered.items():
+            try:
+                freq_hz = int(round(float(getattr(ch_info, 'frequency'))))
+            except Exception:
+                continue
+            sr = getattr(ch_info, 'sample_rate', None)
+            preset = getattr(ch_info, 'preset', None)
+            dest = getattr(ch_info, 'multicast_address', None)
+            sig = (freq_hz, sr, preset, dest)
+            sig_to_channel[sig] = ch_info
+
+        def _ensure_f32_encoding(ssrc: int, chan_label: str) -> bool:
+            try:
+                import time as time_mod
+                for delay_s in (0.0, 0.2, 0.5, 1.0):
+                    if delay_s:
+                        time_mod.sleep(delay_s)
+                    status = control.tune(ssrc=ssrc, encoding=int(desired_encoding), timeout=3.0)
+                    enc = status.get('encoding')
+                    if enc == int(desired_encoding):
+                        return True
+                logger.warning(
+                    f"  {chan_label}: Channel encoding is {enc} (expected {int(desired_encoding)}=F32)"
+                )
+                return False
+            except Exception as e:
+                logger.warning(f"  {chan_label}: Failed to set/verify encoding=F32 via tune(): {e}")
+                return False
         
         logger.info(f"  Found {len(discovered)} existing channels")
         
@@ -882,55 +1074,132 @@ class LiveTimeEngine:
         for ch_spec in TIME_SIGNAL_FREQS:
             freq_hz = int(ch_spec['frequency_hz'])
             name = ch_spec['description']
-            
-            if freq_hz in freq_to_channel:
-                ch_info = freq_to_channel[freq_hz]
-                
-                # Check if destination matches
-                if ch_info.multicast_address != our_destination:
-                    # Reconfigure to our destination
-                    logger.info(f"  ⚙ {name}: reconfiguring to {our_destination}")
-                    try:
-                        control.create_channel(
-                            frequency_hz=freq_hz,
-                            preset=CHANNEL_DEFAULTS['preset'],
-                            sample_rate=CHANNEL_DEFAULTS['sample_rate'],
-                            destination=our_destination,
-                            ssrc=ch_info.ssrc
-                        )
-                        # Re-discover to get updated info
-                        import time as time_mod
-                        time_mod.sleep(0.3)
-                        discovered = discover_channels(self.status_address, listen_duration=1.0)
-                        ch_info = discovered.get(ch_info.ssrc, ch_info)
-                    except Exception as e:
-                        logger.warning(f"  Failed to reconfigure {name}: {e}")
-                
-                logger.info(f"  ✓ {name}: SSRC={ch_info.ssrc}")
-            else:
-                # Create new channel
-                logger.info(f"  ➕ {name}: creating...")
-                try:
-                    ssrc = allocate_ssrc()
-                    control.create_channel(
-                        frequency_hz=freq_hz,
-                        preset=CHANNEL_DEFAULTS['preset'],
-                        sample_rate=CHANNEL_DEFAULTS['sample_rate'],
-                        destination=our_destination,
-                        ssrc=ssrc
-                    )
-                    import time as time_mod
-                    time_mod.sleep(0.3)
-                    discovered = discover_channels(self.status_address, listen_duration=1.0)
-                    ch_info = discovered.get(ssrc)
-                    if ch_info:
-                        logger.info(f"    Created SSRC={ssrc}")
-                    else:
-                        logger.warning(f"    Channel creation unverified")
-                        continue
-                except Exception as e:
-                    logger.error(f"    Failed to create {name}: {e}")
+
+            # Look for an existing channel that matches our desired signature.
+            # Destination is part of the identity; if destination differs, treat as absent.
+            candidate = None
+            for sig, ch_info in sig_to_channel.items():
+                (f, sr, preset, dest) = sig
+                if f != freq_hz:
                     continue
+                if sr is not None and int(sr) != desired_sample_rate:
+                    continue
+                if preset is not None and str(preset) != str(desired_preset):
+                    continue
+                if dest != our_destination:
+                    continue
+                candidate = ch_info
+                break
+
+            if candidate is not None:
+                ch_info = candidate
+                logger.info(f"  ✓ {name}: SSRC={ch_info.ssrc}")
+
+                # Ensure payload encoding is float32 (F32). Do NOT accept S16LE.
+                _ensure_f32_encoding(ch_info.ssrc, name)
+            else:
+                # If a channel already exists on OUR destination with the right frequency,
+                # we may reconfigure it in-place. This avoids hijacking channels used by
+                # other clients, because destination is unique per app.
+                our_dest_candidate = None
+                for sig, ch_info_existing in sig_to_channel.items():
+                    (f, _sr, _preset, dest) = sig
+                    if f == freq_hz and dest == our_destination:
+                        our_dest_candidate = ch_info_existing
+                        break
+
+                if our_dest_candidate is not None:
+                    ch_info = our_dest_candidate
+                    logger.info(f"  ⚙ {name}: reconfiguring existing channel on our destination (SSRC={ch_info.ssrc})")
+                    try:
+                        reconfig_kwargs = {
+                            'frequency_hz': freq_hz,
+                            'preset': desired_preset,
+                            'sample_rate': desired_sample_rate,
+                            'destination': our_destination,
+                            'ssrc': ch_info.ssrc,
+                        }
+                        control.create_channel(**reconfig_kwargs)
+
+                        import time as time_mod
+                        discovered = {}
+                        for delay_s in (0.3, 0.5, 0.8, 1.2, 1.7):
+                            time_mod.sleep(delay_s)
+                            discovered = discover_channels(self.status_address, listen_duration=1.0)
+                            refreshed = discovered.get(ch_info.ssrc)
+                            if refreshed is not None:
+                                ch_info = refreshed
+                                break
+                        logger.info(f"  ✓ {name}: SSRC={ch_info.ssrc}")
+
+                        # Ensure payload encoding is float32 (F32).
+                        _ensure_f32_encoding(ch_info.ssrc, name)
+                    except Exception as e:
+                        logger.warning(f"  Failed to reconfigure {name} on our destination: {e}")
+
+                else:
+                    # Request channel creation matching our signature.
+                    # Prefer radiod-managed SSRC allocation; fall back if API requires explicit SSRC.
+                    logger.info(f"  ➕ {name}: creating...")
+                    try:
+                        create_kwargs = {
+                            'frequency_hz': freq_hz,
+                            'preset': desired_preset,
+                            'sample_rate': desired_sample_rate,
+                            'destination': our_destination,
+                        }
+
+                        try:
+                            control.create_channel(**create_kwargs)
+                        except TypeError:
+                            # Older API requires explicit SSRC
+                            try:
+                                ssrc = allocate_ssrc(frequency_hz=freq_hz)
+                            except TypeError:
+                                try:
+                                    ssrc = allocate_ssrc(freq_hz)
+                                except TypeError:
+                                    ssrc = allocate_ssrc()
+                            control.create_channel(ssrc=ssrc, **create_kwargs)
+
+                        import time as time_mod
+                        discovered = {}
+                        for delay_s in (0.3, 0.5, 0.8, 1.2, 1.7):
+                            time_mod.sleep(delay_s)
+                            discovered = discover_channels(self.status_address, listen_duration=1.0)
+                            if discovered:
+                                break
+
+                        # Refresh signature map and locate the created channel by signature.
+                        sig_to_channel = {}
+                        for _ssrc, _ch_info in discovered.items():
+                            try:
+                                _freq_hz = int(round(float(getattr(_ch_info, 'frequency'))))
+                            except Exception:
+                                continue
+                            _sr = getattr(_ch_info, 'sample_rate', None)
+                            _preset = getattr(_ch_info, 'preset', None)
+                            _dest = getattr(_ch_info, 'multicast_address', None)
+                            sig_to_channel[(_freq_hz, _sr, _preset, _dest)] = _ch_info
+
+                        for sig, _ch_info in sig_to_channel.items():
+                            (f, sr, preset, dest) = sig
+                            if f == freq_hz and dest == our_destination:
+                                if sr is not None and int(sr) != desired_sample_rate:
+                                    continue
+                                if preset is not None and str(preset) != str(desired_preset):
+                                    continue
+                                ch_info = _ch_info
+                                break
+                        else:
+                            logger.warning(f"    Channel creation unverified")
+                            continue
+
+                        # Ensure payload encoding is float32 (F32) after creation.
+                        _ensure_f32_encoding(ch_info.ssrc, name)
+                    except Exception as e:
+                        logger.error(f"    Failed to create {name}: {e}")
+                        continue
             
             self.channels.append({
                 'name': name,
@@ -1192,18 +1461,51 @@ class LiveTimeEngine:
         for name, buffer in self.channel_buffers.items():
             # Get samples for the requested minute using odd/even double-buffering
             samples, start_rtp, start_wallclock = buffer.get_minute_samples(minute)
+
+            if len(samples) > 0 and not np.isfinite(samples).all():
+                bad = int(np.size(samples) - np.count_nonzero(np.isfinite(samples)))
+                logger.warning(f"  {name}: Non-finite IQ samples in minute buffer (bad={bad}/{len(samples)}) - sanitizing")
+                samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # IMPORTANT: Use the buffer-captured start_wallclock as authoritative.
+            # Recomputing (start_rtp/sample_rate + current rtp_system_offset) can drift
+            # because rtp_system_offset is an EMA that changes over time.
+            effective_start_wallclock = start_wallclock
+            rtp_based_start_wallclock = None
+            if (effective_start_wallclock is None or effective_start_wallclock == 0.0) and start_rtp and start_rtp > 0:
+                rtp_offset = self.rtp_system_offset.get(name)
+                if rtp_offset is not None:
+                    rtp_based_start_wallclock = (start_rtp / self.sample_rate) + rtp_offset
+                    effective_start_wallclock = rtp_based_start_wallclock
             
             # Debug: show buffer state
             buffer_duration_s = len(samples) / self.sample_rate if len(samples) > 0 else 0
             if minute % 2 == 1:
-                logger.info(f"  {name}: odd_minute={buffer.odd_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}")
+                logger.info(f"  {name}: odd_minute={buffer.odd_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}, start_rtp={start_rtp}, start_rtp_wallclock={(rtp_based_start_wallclock or 0.0):.1f}")
             else:
-                logger.info(f"  {name}: even_minute={buffer.even_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}")
+                logger.info(f"  {name}: even_minute={buffer.even_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}, start_rtp={start_rtp}, start_rtp_wallclock={(rtp_based_start_wallclock or 0.0):.1f}")
             
-            if len(samples) < self.sample_rate * 30:  # Need at least 30 seconds
-                logger.info(f"  {name}: Insufficient samples ({len(samples)}) for minute {minute} (need {self.sample_rate * 30})")
+            min_needed = int(self.sample_rate * 55)  # Need most of the minute window
+            if len(samples) < min_needed:
+                logger.info(f"  {name}: Insufficient samples ({len(samples)}) for minute {minute} (need {min_needed})")
                 buffer.reset_for_new_minute()
                 continue
+            
+            # FIX 5 (2025-12-11): Verify buffer contains the minute boundary
+            # The tone is at second 0 of the target minute. The buffer should start
+            # at :55 of the previous minute (5 seconds before the tone).
+            # If start_wallclock is AFTER the minute boundary, we missed the tone.
+            minute_boundary = minute * 60
+            if effective_start_wallclock > minute_boundary:
+                seconds_late = effective_start_wallclock - minute_boundary
+                logger.warning(f"  {name}: Buffer started {seconds_late:.1f}s AFTER minute boundary - skipping (missed tone)")
+                continue
+            
+            # Also check if buffer is too early (started before :55 of prev minute)
+            expected_start = minute_boundary - 5.0
+            if effective_start_wallclock < expected_start - 1.0:  # Allow 1s tolerance
+                seconds_early = expected_start - effective_start_wallclock
+                logger.warning(f"  {name}: Buffer started {seconds_early:.1f}s too early - may have stale data")
             
             try:
                 # Get or create Phase2 engine for this channel
@@ -1230,11 +1532,24 @@ class LiveTimeEngine:
                 
                 engine = self._phase2_engines[name]
                 
-                # Use minute boundary as system_time
-                # The buffer spans -5s to +55s around the minute boundary (60 seconds)
-                # Phase 2 adds buffer_duration/2 to get midpoint, so:
-                # system_time = minute_boundary - 5s (buffer starts 5s before)
-                system_time = float(minute * 60) - 5.0
+                # FIX 1 (2025-12-11): Use ACTUAL buffer start time, not calculated
+                # 
+                # Previously: system_time = float(minute * 60) - 5.0
+                # This assumed the buffer always starts exactly at :55 of the previous
+                # minute. But if there's any latency or the buffer doesn't start exactly
+                # at :55, this creates a timing offset that corrupts D_clock.
+                #
+                # Now: Use start_wallclock from the buffer, which is the actual system
+                # time when the first sample arrived. This ties the timing directly to
+                # the GPS-disciplined system clock.
+                #
+                # If start_wallclock is 0 (not set), fall back to calculated value.
+                if effective_start_wallclock and effective_start_wallclock > 0:
+                    system_time = effective_start_wallclock
+                else:
+                    # Fallback to calculated (should rarely happen)
+                    system_time = float(minute * 60) - 5.0
+                    logger.warning(f"  {name}: start_wallclock not set, using calculated system_time={system_time:.3f}")
                 
                 # Run full Phase 2 analysis
                 phase2_result = engine.process_minute(
@@ -1286,28 +1601,56 @@ class LiveTimeEngine:
             self.state = EngineState.TRACKING
             logger.info("State transition: ACQUIRING -> TRACKING")
         
+        applied_clock_update = False
+
         # Fuse D_clock from ALL broadcasts (up to 13) using improved algorithm
         if results:
             fusion_result = self._fuse_broadcasts(results)
             
             if fusion_result:
-                # Use Kalman filter for proper clock convergence
-                raw_d_clock = fusion_result.d_clock_ms
-                convergence = self.clock_convergence.process_measurement(
-                    d_clock_ms=raw_d_clock,
-                    timestamp=time.time(),
-                    measurement_noise_ms=fusion_result.uncertainty_ms
+                logger.info(
+                    f"  Fusion summary: candidates={fusion_result.n_total_candidates} "
+                    f"prefilter_rejected={fusion_result.n_prefilter_rejected} "
+                    f"mad_rejected={fusion_result.n_outliers_rejected} "
+                    f"used={fusion_result.n_broadcasts} grade={fusion_result.quality_grade} "
+                    f"uncertainty={fusion_result.uncertainty_ms:.3f}ms"
                 )
-                
-                # Use Kalman-filtered estimate
-                self.d_clock_ms = convergence.d_clock_ms
-                self.d_clock_uncertainty_ms = convergence.uncertainty_ms
-                self.last_fusion = fusion_result
-                
-                # Log convergence state
-                logger.info(f"  Kalman: raw={raw_d_clock:+.2f}ms → filtered={convergence.d_clock_ms:+.2f}ms "
-                           f"±{convergence.uncertainty_ms:.2f}ms [{convergence.state.value}] "
-                           f"innov={convergence.innovation_ms:+.2f}ms")
+
+                allow_clock_update = (
+                    (
+                        fusion_result.n_broadcasts >= 3
+                        and fusion_result.uncertainty_ms <= 3.0
+                        and fusion_result.quality_grade in ('A', 'B', 'C')
+                    )
+                    or (
+                        fusion_result.n_broadcasts == 2
+                        and fusion_result.uncertainty_ms <= 0.5
+                    )
+                )
+
+                if allow_clock_update:
+                    raw_d_clock = fusion_result.d_clock_ms
+                    convergence = self.clock_convergence.process_measurement(
+                        d_clock_ms=raw_d_clock,
+                        timestamp=time.time(),
+                        measurement_noise_ms=fusion_result.uncertainty_ms
+                    )
+
+                    self.d_clock_ms = convergence.d_clock_ms
+                    self.d_clock_uncertainty_ms = convergence.uncertainty_ms
+                    self.last_fusion = fusion_result
+                    applied_clock_update = True
+
+                    logger.info(
+                        f"  Kalman: raw={raw_d_clock:+.2f}ms → filtered={convergence.d_clock_ms:+.2f}ms "
+                        f"±{convergence.uncertainty_ms:.2f}ms [{convergence.state.value}] "
+                        f"innov={convergence.innovation_ms:+.2f}ms"
+                    )
+                else:
+                    logger.warning(
+                        f"  Fusion gated: used={fusion_result.n_broadcasts} "
+                        f"uncertainty={fusion_result.uncertainty_ms:.2f}ms grade={fusion_result.quality_grade}"
+                    )
                 
                 # Record to fusion history for web GUI
                 self.fusion_history.append({
@@ -1355,7 +1698,7 @@ class LiveTimeEngine:
                 logger.debug(f"SHM publish failed: {e}")
             
             # Update Chrony if enabled
-            if self.enable_chrony and self.chrony_shm:
+            if self.enable_chrony and self.chrony_shm and applied_clock_update:
                 self._update_chrony()
             
             self._save_state()
@@ -1495,6 +1838,9 @@ class LiveTimeEngine:
             '2E': 0.85, '3E': 0.6, 'UNKNOWN': 0.3
         }
         
+        n_total_candidates = len(results)
+        n_prefilter_rejected = 0
+
         # Collect measurements with weights
         measurements = []  # [(broadcast_key, d_clock_raw, d_clock_calibrated, weight, station)]
         
@@ -1514,10 +1860,29 @@ class LiveTimeEngine:
             
             d_clock_raw = r['d_clock_ms']
             
-            # Use propagation-model-corrected d_clock_ms directly
-            # The model handles frequency-dependent propagation delays
-            # No per-broadcast calibration - let Kalman filter handle smoothing
-            d_clock_calibrated = d_clock_raw
+            # FIX 2 (2025-12-11): Pre-filter physically implausible measurements
+            # D_clock should be within ±100ms for a GPSDO-disciplined system.
+            # Values outside this range indicate tone detection failure (observed=0.00ms)
+            # which produces ~±5000ms offsets. Reject these before fusion.
+            if abs(d_clock_raw) > 100.0:
+                logger.debug(f"  {broadcast_key}: REJECTED (d_clock={d_clock_raw:+.1f}ms outside ±100ms)")
+                n_prefilter_rejected += 1
+                continue
+
+            # Apply per-broadcast calibration (station+frequency).
+            # This absorbs systematic biases that remain after propagation modeling
+            # (e.g., CHU cross-frequency offsets, matched-filter group delay, residual 1/f^2 errors).
+            cal_key = self._get_broadcast_key(station, freq_mhz)
+            cal = self.calibration.get(cal_key)
+            cal_offset_ms = 0.0
+            if cal and cal.n_samples >= 10:
+                if abs(float(cal.offset_ms)) <= 500.0:
+                    cal_offset_ms = float(cal.offset_ms)
+                else:
+                    logger.warning(
+                        f"  {broadcast_key}: ignoring invalid calibration offset {float(cal.offset_ms):+.3f}ms"
+                    )
+            d_clock_calibrated = d_clock_raw + cal_offset_ms
             
             # Calculate weight
             confidence = r.get('confidence', 0.5)
@@ -1537,8 +1902,19 @@ class LiveTimeEngine:
                 snr_w = 0.5
             else:
                 snr_w = 0.3
-            
-            weight = max(0.01, confidence * grade_w * mode_w * snr_w)
+
+            # Penalize measurements whose calibration is still uncertain.
+            # If we don't have enough history, cal.uncertainty_ms stays large.
+            cal_uncertainty_w = 1.0
+            if cal and cal.n_samples >= 10:
+                # Map uncertainty to (0.2..1.0) weight factor.
+                # <=1ms => 1.0, 2ms => 0.8, 5ms => 0.4, >=10ms => 0.2
+                cu = max(0.0, float(cal.uncertainty_ms))
+                cal_uncertainty_w = max(0.2, min(1.0, 1.0 - (cu / 12.5)))
+            else:
+                cal_uncertainty_w = 0.3
+
+            weight = max(0.01, confidence * grade_w * mode_w * snr_w * cal_uncertainty_w)
             
             measurements.append((broadcast_key, d_clock_raw, d_clock_calibrated, weight, station, freq_mhz))
             
@@ -1620,6 +1996,31 @@ class LiveTimeEngine:
         
         # Update calibration (EMA learning)
         self._update_calibration(measurements)
+
+        if grade == 'D' or uncertainty > 3.0:
+            # Log the actual measurements that drove the fused value.
+            # This is critical for diagnosing instability: are we mixing stations,
+            # using low-SNR detections, or seeing propagation model mismatch?
+            try:
+                meas_lines = []
+                for broadcast_key, d_clock_raw, d_clock_calibrated, weight, station, freq_mhz in measurements:
+                    r = results.get(broadcast_key, {})
+                    timing_ms = r.get('timing_ms', None)
+                    prop_ms = r.get('propagation_delay_ms', None)
+
+                    cal_key = self._get_broadcast_key(station, freq_mhz)
+                    cal = self.calibration.get(cal_key)
+                    cal_offset_ms = float(cal.offset_ms) if (cal and cal.n_samples >= 10) else 0.0
+                    meas_lines.append(
+                        f"{broadcast_key} {station} {freq_mhz:.2f}MHz: "
+                        f"timing={timing_ms if timing_ms is not None else 'None'}ms "
+                        f"prop={prop_ms if prop_ms is not None else 'None'}ms "
+                        f"raw={d_clock_raw:+.3f}ms cal={cal_offset_ms:+.3f}ms "
+                        f"d_clock={d_clock_calibrated:+.3f}ms w={weight:.3f}"
+                    )
+                logger.info("  Fusion inputs (post-filter): " + "; ".join(meas_lines))
+            except Exception as e:
+                logger.debug(f"Fusion measurement logging failed: {e}")
         
         return FusionResult(
             d_clock_ms=fused_d_clock,
@@ -1628,6 +2029,8 @@ class LiveTimeEngine:
             n_broadcasts=n_broadcasts,
             n_outliers_rejected=n_rejected,
             quality_grade=grade,
+            n_total_candidates=n_total_candidates,
+            n_prefilter_rejected=n_prefilter_rejected,
             wwv_count=wwv_count,
             wwvh_count=wwvh_count,
             chu_count=chu_count
@@ -1637,9 +2040,24 @@ class LiveTimeEngine:
         """
         Update per-broadcast calibration using EMA.
         
-        Calibration offset brings mean D_clock toward 0 (UTC alignment).
+        Calibration offset brings each broadcast's mean D_clock toward the
+        current global clock estimate (self.d_clock_ms).
+
+        This is important because D_clock is not guaranteed to be 0ms.
+        What we actually need is cross-broadcast CONSISTENCY so we can fuse
+        multiple frequencies/stations without inflating uncertainty.
         Uses exponential moving average with α = max(0.5, 20/n_samples).
         """
+        # Only learn calibration when we have a reasonably stable reference.
+        # If we learn too early, we will bake transient acquisition errors into
+        # per-broadcast offsets.
+        reference_d_clock_ms = float(self.d_clock_ms)
+        if not self.clock_convergence.is_locked and self.d_clock_uncertainty_ms > 5.0:
+            return
+
+        if abs(reference_d_clock_ms) > 200.0:
+            return
+
         for broadcast_key, d_clock_raw, _, _, station, freq_mhz in measurements:
             cal_key = self._get_broadcast_key(station, freq_mhz)
             history = self.calibration_history.get(cal_key)
@@ -1652,14 +2070,20 @@ class LiveTimeEngine:
             mean_d_clock = np.mean(recent)
             std_d_clock = np.std(recent) if len(recent) > 1 else 1.0
             
-            # New offset should bring mean to 0
-            new_offset = -mean_d_clock
+            # New offset should bring mean to current global estimate
+            new_offset = reference_d_clock_ms - mean_d_clock
+
+            if abs(float(new_offset)) > 500.0:
+                continue
             
             # EMA update
             old_cal = self.calibration.get(cal_key)
             if old_cal and old_cal.n_samples > 0:
                 alpha = max(0.5, 20.0 / old_cal.n_samples)
                 new_offset = alpha * new_offset + (1 - alpha) * old_cal.offset_ms
+
+            if abs(float(new_offset)) > 500.0:
+                continue
             
             self.calibration[cal_key] = BroadcastCalibration(
                 station=station,

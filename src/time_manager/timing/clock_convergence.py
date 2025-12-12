@@ -277,12 +277,16 @@ class ClockConvergenceModel:
         self.max_consecutive_anomalies = max_consecutive_anomalies
         
         # Kalman filter
+        # FIX 4 (2025-12-11): Reduced measurement_noise_ms from 20.0 to 5.0
+        # for faster convergence. With Fix 2 pre-filtering bad measurements,
+        # we can trust the input more and converge faster.
+        # grape-recorder used 1.0, but 5.0 is more conservative for safety.
         self.kalman = KalmanClockTracker(
             initial_offset_ms=0.0,
             initial_uncertainty_ms=100.0,
             process_noise_offset_ms=0.01,
             process_noise_drift_ms_per_min=0.0001,  # GPSDO: nearly zero
-            measurement_noise_ms=20.0               # Ionospheric variations
+            measurement_noise_ms=5.0                # Reduced for faster convergence
         )
         
         # State
@@ -324,6 +328,22 @@ class ClockConvergenceModel:
             self.consecutive_anomalies += 1
         else:
             self.consecutive_anomalies = 0
+        
+        # FIX 3 (2025-12-11): Reset on huge innovation during acquisition
+        # If innovation is extremely large (>1000ms), the measurement is garbage
+        # and would corrupt the filter. Reset immediately with the new measurement.
+        if abs(innovation) > 1000.0 and self.state in (ConvergenceState.ACQUIRING, ConvergenceState.CONVERGING):
+            logger.warning(f"Clock convergence: Huge innovation ({innovation:+.1f}ms) - resetting filter")
+            self.kalman.reset(initial_offset_ms=d_clock_ms)
+            self.consecutive_anomalies = 0
+            # Re-run update to initialize properly
+            innovation, norm_innov, is_outlier = self.kalman.update(
+                d_clock_ms, timestamp, measurement_noise_ms
+            )
+            offset_ms = self.kalman.offset_ms
+            uncertainty_ms = self.kalman.uncertainty_ms
+            count = self.kalman.count
+            is_anomaly = False
         
         # State machine transitions
         if self.state == ConvergenceState.ACQUIRING:

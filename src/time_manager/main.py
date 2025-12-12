@@ -749,6 +749,16 @@ Examples:
     
     if args.live:
         # Live mode: Twin-Stream architecture with RTP subscription
+        try:
+            import ka9q
+            ka9q_ver = getattr(ka9q, '__version__', 'unknown')
+            if ka9q_ver != '3.2.1':
+                logger.error(f"ka9q-python version mismatch: installed={ka9q_ver}, required=3.2.1")
+                sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to import ka9q-python for version check: {e}")
+            sys.exit(1)
+
         from .engine.live_time_engine import LiveTimeEngine
         
         # Build channel list - auto-discover if SSRCs not configured
@@ -792,7 +802,11 @@ Examples:
             try:
                 from ka9q.discovery import discover_radiod_services
                 logger.info("No status_address configured, discovering radiod instances...")
-                services = discover_radiod_services(timeout=3.0)
+                try:
+                    services = discover_radiod_services(timeout=3.0)
+                except TypeError:
+                    # Backward compatibility: older ka9q-python versions do not accept timeout kwarg
+                    services = discover_radiod_services()
                 
                 if not services:
                     logger.error("No radiod instances found on the network.")
@@ -825,6 +839,7 @@ Examples:
                 sys.exit(1)
             except Exception as e:
                 logger.error(f"Failed to discover radiod: {e}")
+                logger.error(f"Config file used: {args.config}")
                 logger.error("Please configure 'status_address' in [rtp] section of config file.")
                 sys.exit(1)
         
