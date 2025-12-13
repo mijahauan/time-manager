@@ -409,3 +409,16 @@ class ClockConvergenceModel:
     def uncertainty_ms(self) -> float:
         """Current uncertainty."""
         return self.kalman.uncertainty_ms
+    
+    def reset(self, initial_offset_ms: float = 0.0) -> None:
+        """
+        Reset model state (externally forced).
+        
+        Args:
+            initial_offset_ms: New initial clock offset guess
+        """
+        self.kalman.reset(initial_offset_ms=initial_offset_ms)
+        self.state = ConvergenceState.ACQUIRING
+        self.consecutive_anomalies = 0
+        self.locked_offset_ms = None
+        logger.info(f"Clock convergence: Reset with initial offset {initial_offset_ms:+.2f}ms")

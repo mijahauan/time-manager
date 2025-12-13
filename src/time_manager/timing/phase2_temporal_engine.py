@@ -566,7 +566,10 @@ class Phase2TemporalEngine:
         self,
         iq_samples: np.ndarray,
         system_time: float,
-        rtp_timestamp: int
+        rtp_timestamp: int,
+        minute_boundary: float,
+        search_window_ms: float = 1500.0,
+        expected_offset_ms: Optional[float] = None
     ) -> TimeSnapResult:
         """
         Step 1: Fundamental Tone Detection & Time Snap Correction.
@@ -578,6 +581,9 @@ class Phase2TemporalEngine:
             iq_samples: Full-rate (20 kHz) complex64 IQ samples
             system_time: System time of first sample
             rtp_timestamp: RTP timestamp of first sample
+            minute_boundary: Explicit UTC minute boundary
+            search_window_ms: Search window width (ms)
+            expected_offset_ms: Expected offset center (ms)
             
         Returns:
             TimeSnapResult with initial timing anchor
@@ -589,18 +595,33 @@ class Phase2TemporalEngine:
         buffer_mid_time = system_time + buffer_duration / 2
         
         # Run matched filter tone detection at FULL RATE (20 kHz)
-        # The tone detector is initialized with self.sample_rate (full rate)
-        # for maximum timing accuracy and sub-sample interpolation precision.
-        # Full-rate detection provides more accurate timing than decimated.
-        # Future optimization: implement proper anti-alias decimation.
         detections = self.tone_detector.process_samples(
             timestamp=buffer_mid_time,
             samples=iq_samples,  # Full rate for accuracy
             rtp_timestamp=rtp_timestamp,
             original_sample_rate=self.sample_rate,
-            buffer_rtp_start=rtp_timestamp
+            buffer_rtp_start=rtp_timestamp,
+            minute_boundary_timestamp=minute_boundary,
+            search_window_ms=search_window_ms,
+            expected_offset_ms=expected_offset_ms
         )
         
+        # FAILURE MODE HANDLING:
+        # If no tones detected (detections is None or empty), we CANNOT proceed with
+        # a valid time snap. Returning 0.0ms timing error here would be fatal science.
+        if not detections:
+            logger.debug("Step 1 Time Snap: No tones detected - returning empty/failed result")
+            return TimeSnapResult(
+                timing_error_ms=0.0, # Will be ignored because confidence is 0
+                arrival_rtp=rtp_timestamp,
+                arrival_system_time=system_time,
+                wwv_detected=False,
+                wwvh_detected=False,
+                chu_detected=False,
+                anchor_station='NONE',
+                anchor_confidence=0.0
+            )
+
         # Extract detection results
         wwv_det = None
         wwvh_det = None
@@ -618,6 +639,9 @@ class Phase2TemporalEngine:
         
         # Determine anchor station (highest confidence detection)
         # Priority: WWV > CHU > WWVH (CHU uses same 1000 Hz as WWV)
+        if detections:
+            logger.info(f"Step 1 Detections: {[f'{d.station}: conf={d.confidence:.1f}' for d in detections]}")
+            
         anchor_station = 'UNKNOWN'
         anchor_confidence = 0.0
         timing_error_ms = 0.0
@@ -628,24 +652,24 @@ class Phase2TemporalEngine:
             if wwv_det.confidence >= wwvh_det.confidence:
                 anchor_station = 'WWV'
                 anchor_confidence = wwv_det.confidence
-                timing_error_ms = wwv_det.timing_error_ms or 0.0
+                timing_error_ms = wwv_det.timing_error_ms
             else:
                 anchor_station = 'WWVH'
                 anchor_confidence = wwvh_det.confidence
-                timing_error_ms = wwvh_det.timing_error_ms or 0.0
+                timing_error_ms = wwvh_det.timing_error_ms
         elif wwv_det:
             anchor_station = 'WWV'
             anchor_confidence = wwv_det.confidence
-            timing_error_ms = wwv_det.timing_error_ms or 0.0
+            timing_error_ms = wwv_det.timing_error_ms
         elif chu_det:
             # CHU detected (500ms @ 1000 Hz) - valid time reference
             anchor_station = 'CHU'
             anchor_confidence = chu_det.confidence
-            timing_error_ms = chu_det.timing_error_ms or 0.0
+            timing_error_ms = chu_det.timing_error_ms
         elif wwvh_det:
             anchor_station = 'WWVH'
             anchor_confidence = wwvh_det.confidence
-            timing_error_ms = wwvh_det.timing_error_ms or 0.0
+            timing_error_ms = wwvh_det.timing_error_ms
         
         # Calculate arrival RTP from timing error
         # Use round() not int() for proper rounding (at 20kHz, 1 sample = 0.05ms)
@@ -1412,7 +1436,10 @@ class Phase2TemporalEngine:
         self,
         iq_samples: np.ndarray,
         system_time: float,
-        rtp_timestamp: int
+        rtp_timestamp: int,
+        minute_boundary: Optional[float] = None,
+        search_window_ms: float = 1500.0,
+        expected_offset_ms: Optional[float] = None
     ) -> Optional[Phase2Result]:
         """
         Process one minute of IQ data through the complete Phase 2 pipeline.
@@ -1428,19 +1455,25 @@ class Phase2TemporalEngine:
             iq_samples: Complex64 IQ samples (60 seconds at sample_rate)
             system_time: System time of first sample (Unix timestamp)
             rtp_timestamp: RTP timestamp of first sample
+            minute_boundary: Explicit UTC minute boundary (timestamp of :00)
+            search_window_ms: Search window for tone detection (default 1500.0)
+            expected_offset_ms: Expected clock offset (default None)
             
         Returns:
             Phase2Result containing all analysis outputs and final D_clock,
             or None if analysis fails completely
         """
-        # Calculate minute boundary
-        # In live mode, buffers typically start at :55 (5s pre-roll) and contain
-        # the tone at :00 of the *target* minute.
-        # If we compute the minute boundary from the raw buffer start time,
-        # we will anchor to the previous minute and introduce a ~5s error.
-        minute_anchor_time = system_time + 5.0
-        minute_boundary = (int(minute_anchor_time) // 60) * 60
-        minute_number = int((minute_anchor_time // 60) % 60)
+        # Calculate minute boundary if not provided (but logging warning)
+        if minute_boundary is None:
+            # In live mode, buffers typically start at :55 (5s pre-roll) and contain
+            # the tone at :00 of the *target* minute.
+            # If we compute the minute boundary from the raw buffer start time,
+            # we will anchor to the previous minute and introduce a ~5s error.
+            minute_anchor_time = system_time + 5.0
+            minute_boundary = (int(minute_anchor_time) // 60) * 60
+            logger.warning(f"Phase 2: minute_boundary not provided, inferred {minute_boundary} from system_time={system_time:.1f}")
+        
+        minute_number = int((minute_boundary // 60) % 60)
         
         # Validate and normalize input
         iq_samples, validation_metrics = self._validate_input(iq_samples)
@@ -1453,8 +1486,16 @@ class Phase2TemporalEngine:
             time_snap = self._step1_tone_detection(
                 iq_samples=iq_samples,
                 system_time=system_time,
-                rtp_timestamp=rtp_timestamp
+                rtp_timestamp=rtp_timestamp,
+                minute_boundary=minute_boundary,
+                search_window_ms=search_window_ms,
+                expected_offset_ms=expected_offset_ms
             )
+            
+            # FAIL EARLY if Time Snap failed
+            if time_snap.anchor_station == 'NONE' or time_snap.anchor_confidence == 0.0:
+                logger.warning(f"Phase 2 aborted: No valid time snap anchor (confidence=0.0)")
+                return None
             
             # === STEP 2: Ionospheric Channel Characterization ===
             channel = self._step2_channel_characterization(

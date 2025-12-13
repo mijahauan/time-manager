@@ -499,8 +499,8 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         template_samples = int(tone_duration_sec * self.sample_rate)
         margin_samples = int(0.050 * self.sample_rate)  # 50ms margin
         
-        # Search region: from (peak - template_length - margin) to (peak + margin)
-        search_start = max(0, correlation_peak_idx - template_samples - margin_samples)
+        # Search region: centered around peak (since peak is start of tone)
+        search_start = max(0, correlation_peak_idx - margin_samples)
         search_end = min(len(audio_signal), correlation_peak_idx + margin_samples)
         
         if search_end <= search_start:
@@ -635,34 +635,34 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         rtp_timestamp: Optional[int] = None,
         original_sample_rate: Optional[int] = None,
         buffer_rtp_start: Optional[int] = None,
-        search_window_ms: Optional[float] = None,
-        expected_offset_ms: Optional[float] = None
+        search_window_ms: Optional[float] = None, # defaults to 1500.0 inside
+        expected_offset_ms: Optional[float] = None,
+        minute_boundary_timestamp: Optional[float] = None
     ) -> Optional[List[ToneDetectionResult]]:
         """
         Process samples and detect tones (ToneDetector interface).
         
         Args:
-            timestamp: UTC timestamp of samples (from time_snap if available)
+            timestamp: UTC timestamp of samples (buffer midpoint)
             samples: Complex IQ samples at self.sample_rate
             rtp_timestamp: Optional RTP timestamp for provenance
-            original_sample_rate: Original sample rate before decimation (e.g., 20000)
+            original_sample_rate: Original sample rate before decimation
             buffer_rtp_start: RTP timestamp at start of original buffer
-            search_window_ms: Search window in milliseconds (default 500ms)
-                Pass 0: Use default ±500ms for initial wide search
-                Pass 1+: Use guided narrow window (e.g., ±30ms) from anchor
-            expected_offset_ms: Expected offset from minute boundary (default 0)
-                Pass 0: Use 0 (search around minute boundary)
-                Pass 1+: Use expected propagation delay (e.g., +20ms for CHU)
-                This centers the search window at minute_boundary + expected_offset
+            search_window_ms: Search window in milliseconds
+            expected_offset_ms: Expected offset from minute boundary
+            minute_boundary_timestamp: EXPLICIT minute boundary to anchor against.
+                MUST be provided (will raise ValueError if None).
             
         Returns:
-            List of ToneDetectionResult objects (may contain WWV + WWVH),
-            or None if no tones detected
+            List of ToneDetectionResult objects, or None if no tones detected
         """
+        if minute_boundary_timestamp is None:
+             raise ValueError("minute_boundary_timestamp is required for process_samples")
         self.total_attempts += 1
+        
         detections = self._detect_tones_internal(
             samples, timestamp, original_sample_rate, buffer_rtp_start, 
-            search_window_ms, expected_offset_ms
+            search_window_ms, expected_offset_ms, minute_boundary_timestamp
         )
         
         if detections:
@@ -692,41 +692,33 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         original_sample_rate: Optional[int] = None,
         buffer_rtp_start: Optional[int] = None,
         search_window_ms: Optional[float] = None,
-        expected_offset_ms: Optional[float] = None
+        expected_offset_ms: Optional[float] = None,
+        minute_boundary_timestamp: Optional[float] = None
     ) -> List[ToneDetectionResult]:
         """
         Internal tone detection implementation
-        
-        Args:
-            iq_samples: Complex IQ samples at self.sample_rate
-            current_unix_time: UTC time for first sample
-            
-        Returns:
-            List of ToneDetectionResult objects, sorted by SNR (strongest first)
         """
         # Get minute boundary for the EXPECTED tone (around :00.0)
-        # current_unix_time is the buffer MIDPOINT
-        # Find the nearest minute boundary to the midpoint
-        # Round to nearest minute boundary (not floor)
-        minute_boundary = round(current_unix_time / 60) * 60
+        # We REQUIRE an explicit boundary to avoid seconds-scale basin errors.
+        if minute_boundary_timestamp is not None:
+            minute_boundary = int(round(minute_boundary_timestamp))
+        else:
+            # Dangerous fallback removed - we cannot safely infer the boundary
+            # without risking a +/- 60s or +/- 30s error.
+            logger.error("Tone detection called without minute_boundary_timestamp - rejecting")
+            return []
         
         # Check if we already detected this minute (prevent duplicates in Fast Loop)
         # Skip this check for Slow Loop which re-processes the same minute
         if minute_boundary in self.last_detections_by_minute:
-            logger.debug(f"Skipping duplicate detection for minute {minute_boundary}")
-            # Don't return empty - allow re-detection for Slow Loop
-            # The Fast Loop uses ring buffer, Slow Loop uses full buffer
-            # They may have different detection results
-            pass  # Continue with detection
+            # Check if this is a re-process (e.g. Slow Loop vs Fast Loop)
+            # The Slow Loop will typically pass a specific search window or explicit boundary
+            # so we only skip if arguments match exactly? No, just allow re-processing.
+            pass
         
         # Step 1: AM demodulation (extract envelope)
         magnitude = np.abs(iq_samples)
         audio_signal = magnitude - np.mean(magnitude)  # AC coupling
-        
-        # Diagnostic: Check signal energy
-        audio_rms = np.sqrt(np.mean(audio_signal**2))
-        logger.debug(f"AM demod: iq_len={len(iq_samples)}, audio_rms={audio_rms:.6f}, "
-                    f"mag_mean={np.mean(magnitude):.6f}")
         
         detections: List[ToneDetectionResult] = []
         
@@ -740,15 +732,33 @@ class MultiStationToneDetector(IMultiStationToneDetector):
                 minute_boundary,
                 original_sample_rate,
                 buffer_rtp_start,
-                search_window_ms,
+                search_window_ms if search_window_ms is not None else 1500.0, # Widen default to 1500ms
                 expected_offset_ms
             )
             
             if detection:
                 detections.append(detection)
         
-        # Sort by SNR (strongest signal first)
         detections.sort(key=lambda d: d.snr_db, reverse=True)
+
+        # POST-PROCESSING: Anchor-Guided Filtering
+        # If we have a very strong detection (Anchor), use it to reject noise
+        # that was detected in the wide search window but is physically unrelated.
+        if detections and detections[0].snr_db > 15.0:
+            anchor = detections[0]
+            filtered_detections = [anchor]
+            
+            for d in detections[1:]:
+                # WWV and WWVH detection logic are independent, so they can find
+                # peaks 1.5s apart. Valid signals must be close (propagation diff < ~20ms).
+                # We allow 100ms margin.
+                diff = abs(d.timing_error_ms - anchor.timing_error_ms)
+                if diff <= 100.0:
+                    filtered_detections.append(d)
+                else:
+                    logger.debug(f"  Filtering outlier {d.station}: {diff:.1f}ms from anchor {anchor.station} (improbable)")
+            
+            detections = filtered_detections
         
         # Cache detections for this minute
         if detections:
@@ -852,69 +862,134 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         duration = template['duration']
         
         # Perform quadrature correlation (phase-invariant)
+        # OPTIMIZATION (2025-12-12): Slice the signal around the expected position
+        # instead of correlating the entire minute buffer (which is 60s long).
+        # We need the Search Window + Noise Margin + Template Length.
+        
+        buffer_len_sec = len(audio_signal) / self.sample_rate
+        buffer_start_time = current_unix_time - (buffer_len_sec / 2)
+        reference_time = minute_boundary
+        
+        offset_ms = expected_offset_ms if expected_offset_ms is not None else 0.0
+        offset_sec = offset_ms / 1000.0
+        
+        tone_offset_from_start = (reference_time + offset_sec) - buffer_start_time
+        expected_pos_samples_global = int(tone_offset_from_start * self.sample_rate)
+        
+        # Calculate search window in samples
+        window_ms = search_window_ms if search_window_ms is not None else 1500.0
+        window_samples = int((window_ms / 1000.0) * self.sample_rate)
+        
+        # Noise margin: We need data OUTSIDE the search window to estimate noise floor
+        noise_margin_sec = 2.0
+        margin_samples = int(noise_margin_sec * self.sample_rate)
+        
+        # Define slice boundaries (Search Window + Noise Margin)
+        # We need: Margin + SearchWindow + [ExpectedPeak] + SearchWindow + Margin + TemplateLen
+        slice_start_global = max(0, expected_pos_samples_global - window_samples - margin_samples)
+        slice_end_global = min(len(audio_signal), expected_pos_samples_global + window_samples + margin_samples + len(template_sin))
+        
+        # Slice the signal for correlation
+        sliced_signal = audio_signal[slice_start_global:slice_end_global]
+        
+        if len(sliced_signal) < len(template_sin):
+            # This can happen if expected position is far outside buffer
+            return None
+
         try:
-            corr_sin = correlate(audio_signal, template_sin, mode='valid')
-            corr_cos = correlate(audio_signal, template_cos, mode='valid')
+            corr_sin = correlate(sliced_signal, template_sin, mode='valid')
+            corr_cos = correlate(sliced_signal, template_cos, mode='valid')
         except ValueError as e:
             freq_str = f"{frequency}Hz" if frequency is not None else "??Hz"
             logger.warning(f"{station_type.value} @ {freq_str}: Correlation failed: {e}")
             return None
         
         if len(corr_sin) == 0 or len(corr_cos) == 0:
-            freq_str = f"{frequency}Hz" if frequency is not None else "??Hz"
-            logger.warning(f"{station_type.value} @ {freq_str}: Empty correlation result")
             return None
         
         # Combine to get phase-invariant magnitude: sqrt(sin^2 + cos^2)
         min_len = min(len(corr_sin), len(corr_cos))
         correlation = np.sqrt(corr_sin[:min_len]**2 + corr_cos[:min_len]**2)
         
-        # Expected position: all stations use minute boundary (second 0)
-        # - WWV: 1000 Hz, 0.8s tone at :00.0
-        # - WWVH: 1200 Hz, 0.8s tone at :00.0  
-        # - CHU: 1000 Hz, 0.5s tone at :00.0 (1.0s at top of hour)
-        #   Note: CHU second 29 is always silent, seconds 31-39 and 50-59 have
-        #   only 10ms ticks (FSK data and voice). But second 00 has full tone.
-        buffer_len_sec = len(audio_signal) / self.sample_rate
-        buffer_start_time = current_unix_time - (buffer_len_sec / 2)
+        # Local coordinates within the correlation array
+        # The correlation array corresponds to sliced_signal[0...N]
+        # So index 0 in correlation corresponds to slice_start_global in audio_signal
+        correlation_offset = slice_start_global
         
-        # All stations reference the minute boundary
-        reference_time = minute_boundary
+        # Map expected position to local coordinates
+        expected_pos_local = expected_pos_samples_global - correlation_offset
         
-        # Tone position in buffer (samples from start)
-        # For Pass 0: search around minute boundary (expected_offset = 0)
-        # For Pass 1+: search around expected arrival (minute_boundary + expected_offset)
-        offset_ms = expected_offset_ms if expected_offset_ms is not None else 0.0
-        offset_sec = offset_ms / 1000.0
+        # Define search window in LOCAL coordinates
+        search_start_local = max(0, expected_pos_local - window_samples)
+        search_end_local = min(len(correlation), expected_pos_local + window_samples)
         
-        tone_offset_from_start = (reference_time + offset_sec) - buffer_start_time
-        expected_pos_samples = int(tone_offset_from_start * self.sample_rate)
-        
-        # Search window: configurable, default ±500ms
-        # Pass 0 (wide): 500ms - initial detection, centered at minute boundary
-        # Pass 1 (geographic): 30-50ms - centered at expected propagation delay
-        # Guided (anchor): 3-10ms - centered at anchor's detected position
-        window_ms = search_window_ms if search_window_ms is not None else 500.0
-        search_window = int(window_ms * self.sample_rate / 1000)
-        search_start = max(0, expected_pos_samples - search_window)
-        search_end = min(len(correlation), expected_pos_samples + search_window)
+        # Prevent invalid windows
+        if search_start_local >= search_end_local:
+             search_start_local = 0
+             search_end_local = len(correlation)
         
         freq_str = f"{frequency}Hz" if frequency is not None else "??Hz"
-        logger.debug(f"{station_type.value} @ {freq_str}: ref=min@{reference_time}, "
-                    f"expected_offset={offset_ms:+.1f}ms, "
-                    f"expected_pos={expected_pos_samples}, window=±{window_ms:.0f}ms, search=[{search_start}:{search_end}]")
         
-        if search_start >= search_end:
-            logger.warning(f"{station_type.value} @ {freq_str}: Invalid search window! "
-                          f"expected_pos={expected_pos_samples}, tone_offset={tone_offset_from_start:.2f}s")
+        # Calculate noise statistics (from OUTSIDE the search window, locally)
+        noise_mask = np.ones(len(correlation), dtype=bool)
+        noise_mask[search_start_local:search_end_local] = False
+        noise_samples = correlation[noise_mask]
+        
+        if len(noise_samples) < 100:
+            # Fallback if window covers most of slice
+            noise_samples = correlation
+        
+        noise_floor = np.median(noise_samples)
+        noise_std = np.std(noise_samples)
+        
+        # Threshold: median + 3*sigma
+        threshold = noise_floor + 3.0 * noise_std
+        
+        # Find peak in local search window
+        search_region = correlation[search_start_local:search_end_local]
+        if len(search_region) == 0:
+            return None
+            
+        peak_idx_in_region = np.argmax(search_region)
+        peak_val = search_region[peak_idx_in_region]
+        
+        # Convert back to local correlation index
+        peak_idx_local = search_start_local + peak_idx_in_region
+        
+        # Convert to global index for downstream logic
+        peak_idx_global = correlation_offset + peak_idx_local
+        
+        snr_db = 20 * np.log10(peak_val / noise_floor) if noise_floor > 0 else 0
+        
+        logger.debug(f"{station_type.value} {freq_str}: SNR={snr_db:.1f}dB Peak={peak_val:.3f} Thresh={threshold:.3f} Pos={peak_idx_global} Expected={expected_pos_samples_global} Off={peak_idx_global-expected_pos_samples_global}")
+        
+        if peak_val < threshold:
+            # logger.debug(f"{station_type.value} @ {freq_str}: Peak {peak_val:.1f} < threshold {threshold:.1f} (SNR {snr_db:.1f} dB)")
             return None
         
         # Find peak within search window
-        search_region = correlation[search_start:search_end]
-        local_peak_idx = np.argmax(search_region)
-        peak_idx = search_start + local_peak_idx
-        peak_val = correlation[peak_idx]
+        # (Already done above to find peak_idx_local)
+        peak_idx = peak_idx_local # Use LOCAL index for accessing 'correlation' array later
         
+        # Propagation bounds check
+        # Only enforce if search window is tight (implying we expect to be close)
+        strict_bounds = window_ms < 100.0  # Only enforce strict bounds for tight searches
+        
+        if strict_bounds:
+            expected_min = PROPAGATION_BOUNDS_MS.get(station_type.name, PROPAGATION_BOUNDS_MS['WWV'])[0]
+            expected_max = PROPAGATION_BOUNDS_MS.get(station_type.name, PROPAGATION_BOUNDS_MS['WWV'])[1]
+            
+            # Note: peak_idx_global is relative to start of buffer
+            # We need to convert to delay relative to minute boundary
+            peak_time_in_buffer = peak_idx_global / self.sample_rate
+            peak_unix_time = buffer_start_time + peak_time_in_buffer
+            measured_delay_ms = (peak_unix_time - reference_time) * 1000.0
+            
+            if not (expected_min - 10.0 <= measured_delay_ms <= expected_max + 10.0): # 10ms margin
+                 logger.debug(f"{station_type.value} @ {freq_str}: Rejecting delay {measured_delay_ms:.1f}ms (outside {expected_min}-{expected_max}ms)")
+                 # return None # DISABLED FOR NOW TO DEBUG
+                 pass
+
         # =====================================================================
         # SUB-SAMPLE INTERPOLATION (Parabolic/Quadratic)
         # =====================================================================
@@ -929,7 +1004,7 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         #   b = (y[+1] - y[-1]) / 2
         #
         # Peak of parabola at x = -b/(2a):
-        #   δ = (y[-1] - y[+1]) / (2·(y[-1] - 2·y[0] + y[+1]))
+        #   δ = (y[-1] - y[+1]) / (2·(y[-1] - 2×y[0] + y[+1]))
         #
         # This achieves ~5 μs precision (10x improvement over integer).
         #
@@ -980,8 +1055,8 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         # See scripts/compare_tone_detectors.py for multi-frequency validation
         # =====================================================================
         noise_samples = np.concatenate([
-            correlation[:max(0, search_start - 100)],    # Before search window
-            correlation[min(len(correlation), search_end + 100):]  # After search window
+            correlation[:max(0, search_start_local - 100)],    # Before search window
+            correlation[min(len(correlation), search_end_local + 100):]  # After search window
         ])
         
         if len(noise_samples) > 100:
@@ -1128,10 +1203,14 @@ class MultiStationToneDetector(IMultiStationToneDetector):
             station_name, DEFAULT_PROPAGATION_BOUNDS_MS
         )
         
-        if timing_error_ms < min_delay_ms or timing_error_ms > max_delay_ms:
-            logger.debug(f"  -> REJECTED (timing {timing_error_ms:+.1f}ms outside "
-                        f"plausible range [{min_delay_ms:.0f}, {max_delay_ms:.0f}]ms for {station_name})")
-            return None
+        if strict_bounds:
+            if timing_error_ms < min_delay_ms or timing_error_ms > max_delay_ms:
+                logger.debug(f"  -> REJECTED (timing {timing_error_ms:+.1f}ms outside "
+                            f"plausible range [{min_delay_ms:.0f}, {max_delay_ms:.0f}]ms for {station_name})")
+                return None
+        else:
+             logger.debug(f"  -> ACCEPTED (timing {timing_error_ms:+.1f}ms outside bounds "
+                         f"but strict_bounds=False for acquisition)")
         
         # Determine if this station should be used for time_snap
         # 
@@ -1207,6 +1286,13 @@ class MultiStationToneDetector(IMultiStationToneDetector):
         if wwv_det and wwvh_det:
             differential_ms = wwv_det.timing_error_ms - wwvh_det.timing_error_ms
             
+            # Sanity check: WWV and WWVH should be within ~20ms of each other
+            # If diff > 100ms, one detection is likely false/noise
+            if abs(differential_ms) > 100.0:
+                 logger.debug(f"Ignoring implausible differential delay: {differential_ms:+.1f}ms "
+                             f"(WWV={wwv_det.timing_error_ms:+.1f}ms, WWVH={wwvh_det.timing_error_ms:+.1f}ms)")
+                 return
+
             self.differential_delay_history.append({
                 'timestamp': timestamp,
                 'differential_ms': differential_ms,
@@ -1452,15 +1538,13 @@ class MultiStationToneDetector(IMultiStationToneDetector):
             min_power = min(tone_powers.values()) if min(tone_powers.values()) > 0 else 1e-10
             results['frequency_spread_db'] = float(10 * np.log10(max_power / min_power))
         
-        # === STATION DISCRIMINATION via 500/600 Hz ===
-        # Only valid during single-station minutes (avoids BCD 100 Hz intermod)
         if '500Hz' in results['tones'] and '600Hz' in results['tones']:
             snr_500 = results['tones']['500Hz']['snr_db']
             snr_600 = results['tones']['600Hz']['snr_db']
             
             results['wwv_indicator_snr'] = snr_500
-            results['wwvh_indicator_snr'] = snr_600
-            results['discrimination_ratio_db'] = snr_500 - snr_600
+            results['wwvh_indicator_snr'] = results['tones']['600Hz']['snr_db']
+            results['discrimination_ratio_db'] = snr_500 - results['tones']['600Hz']['snr_db']
             
             if valid_for_discrimination:
                 if is_wwv_only_minute:

@@ -196,73 +196,82 @@ class ChannelBuffer:
         self.last_wallclock = wallclock
         self.packets_received += 1
         
-        n_samples = len(samples)
+        # FIX (2025-12-12): Gap Stuffing for Timing Integrity
+        # If RTP timestamp jumps, we must insert silence to keep buffer indices aligned with time.
+        if hasattr(self, 'next_expected_rtp') and self.next_expected_rtp is not None:
+            gap = rtp_timestamp - self.next_expected_rtp
+            if gap > 0:
+                # Sanity check: limit gap stuffing to e.g. 60 seconds to avoid OOM on massive drop
+                if gap > 60 * self.sample_rate:
+                    logger.warning(f"gap {gap} too large, resetting stream alignment")
+                    self.next_expected_rtp = None # Treat as new stream
+                else:
+                    logger.warning(f"Gap detected: {gap} samples ({gap/self.sample_rate*1000:.1f}ms). Stuffing with zeros.")
+                    gap_zeros = np.zeros(gap, dtype=samples.dtype)
+                    samples = np.concatenate([gap_zeros, samples])
+                    # Shift timestamp back to start of gap
+                    rtp_timestamp = self.next_expected_rtp
         
-        # Cap samples to buffer sizes to handle large RTP gaps gracefully
-        if n_samples > self.ring_size:
-            logger.warning(f"Dropping {n_samples - self.ring_size} samples (chunk too large for ring buffer)")
-            samples = samples[-self.ring_size:]
-            n_samples = self.ring_size
+        # Use the full (possibly stuffed) samples for the Slow Loop to maintain minute-alignment
+        full_samples = samples
+        n_full = len(full_samples)
         
-        # Determine which minute buffer to write to based on wallclock
-        # Each buffer spans 70 seconds: from prev:55 through minute:00-59 to next:05
-        # 
-        # Timeline for odd minute N (where N is odd):
-        #   N-1 (even):55 -> N:00 -> N:59 -> N+1 (even):05
-        #   All these samples go to odd_buffer for minute N
-        #
-        # Timeline for even minute M (where M is even):
-        #   M-1 (odd):55 -> M:00 -> M:59 -> M+1 (odd):05
-        #   All these samples go to even_buffer for minute M
+        # Update expected next RTP (for next call)
+        self.next_expected_rtp = rtp_timestamp + n_full
         
+        # Prepare samples for Ring Buffer (Fast Loop) - Truncate if too large
+        if n_full > self.ring_size:
+            logger.warning(f"Truncating {n_full - self.ring_size} samples for Ring Buffer (kept full for Slow Loop)")
+            ring_samples = full_samples[-self.ring_size:]
+            n_ring = self.ring_size
+        else:
+            ring_samples = full_samples
+            n_ring = n_full
+        
+        # Determine target minute based on wallclock
         current_second = wallclock % 60
         current_minute = int(wallclock) // 60
         
-        # Determine target minute based on where we are in the 70-second window
-        # Buffer for minute N should contain the tone at N:00
-        # So buffer spans from N-1:55 to N:55 (60 seconds centered on N:00)
-        # 
-        # At N-1:55 to N-1:59: samples go to minute N (pre-roll)
-        # At N:00 to N:54: samples go to minute N (main content with tone)
-        # At N:55 to N:59: samples go to minute N+1 (pre-roll for next)
         if current_second >= 55:
-            # We're in the last 5 seconds - samples belong to NEXT minute's buffer
             target_minute = current_minute + 1
         else:
-            # We're in :00-:54 - samples belong to CURRENT minute's buffer
             target_minute = current_minute
         
-        # Route to odd or even buffer based on target minute
+        # Route FULL samples to odd or even buffer (Slow Loop)
         if target_minute % 2 == 1:
-            # Target is odd minute
             if self.odd_minute != target_minute:
-                # New odd minute - reset buffer (happens at :55 of even minute)
                 self.odd_write_pos = 0
                 self.odd_start_rtp = 0
                 self.odd_start_wallclock = 0.0
                 self.odd_minute = target_minute
-            self._add_to_odd(samples, rtp_timestamp, wallclock, n_samples)
+            self._add_to_odd(full_samples, rtp_timestamp, wallclock, n_full)
         else:
-            # Target is even minute
             if self.even_minute != target_minute:
-                # New even minute - reset buffer (happens at :55 of odd minute)
                 self.even_write_pos = 0
                 self.even_start_rtp = 0
                 self.even_start_wallclock = 0.0
                 self.even_minute = target_minute
-            self._add_to_even(samples, rtp_timestamp, wallclock, n_samples)
+            self._add_to_even(full_samples, rtp_timestamp, wallclock, n_full)
         
-        # Ring buffer: circular write (always)
+        # Ring buffer: circular write using TRUNCATED samples
         write_start = self.ring_write_pos % self.ring_size
         
-        if write_start + n_samples <= self.ring_size:
-            self.ring_buffer[write_start:write_start + n_samples] = samples
+        if write_start + n_ring <= self.ring_size:
+            self.ring_buffer[write_start:write_start + n_ring] = ring_samples
         else:
             first_part = self.ring_size - write_start
-            self.ring_buffer[write_start:] = samples[:first_part]
-            self.ring_buffer[:n_samples - first_part] = samples[first_part:]
+            self.ring_buffer[write_start:] = ring_samples[:first_part]
+            self.ring_buffer[:n_ring - first_part] = ring_samples[first_part:]
         
-        self.ring_write_pos += n_samples
+        self.ring_write_pos += n_ring
+        
+        # Update ring_start_rtp correctly using FULL original length
+        # Start = End_of_Stream - Ring_Size
+        current_end_rtp = rtp_timestamp + n_full
+        if self.ring_write_pos >= self.ring_size:
+            self.ring_start_rtp = current_end_rtp - self.ring_size
+        elif self.packets_received == 1:
+            self.ring_start_rtp = rtp_timestamp
     
     def _add_to_odd(self, samples: np.ndarray, rtp_timestamp: int, wallclock: float, n_samples: int):
         """Add samples to odd minute buffer."""
@@ -463,6 +472,9 @@ class LiveTimeEngine:
         
         # Callback for fusion updates (used by web server)
         self.on_fusion_update: Optional[Callable[[FusionResult], None]] = None
+        
+        # Rejection monitoring
+        self.consecutive_rejections = 0
         
         # TransmissionTimeSolver for computing per-station propagation delays
         self._propagation_solver = None
@@ -1340,13 +1352,19 @@ class LiveTimeEngine:
                 buffer_midpoint_time = buffer_end_time - (buffer_duration / 2)
                 
                 # Run tone detection with narrow window (Fast Loop uses previous state)
+                # Tones are at :00 (start of NEXT minute).
+                # We are at T=:01 of current minute.
+                # The tone we just heard is for the CURRENT minute boundary (second 0).
+                current_minute_boundary = float(minute * 60)
+                
                 detections = detector.process_samples(
                     timestamp=buffer_midpoint_time,
                     samples=samples,
                     rtp_timestamp=start_rtp,
                     original_sample_rate=self.sample_rate,
-                    search_window_ms=100.0,  # Narrow ±100ms window
-                    expected_offset_ms=state.propagation_delay_ms  # Expected arrival
+                    search_window_ms=300.0,  # Trusted clock constraint
+                    expected_offset_ms=self.clock_convergence.d_clock_ms,
+                    minute_boundary_timestamp=current_minute_boundary
                 )
                 
                 if detections:
@@ -1467,23 +1485,34 @@ class LiveTimeEngine:
                 logger.warning(f"  {name}: Non-finite IQ samples in minute buffer (bad={bad}/{len(samples)}) - sanitizing")
                 samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # IMPORTANT: Use the buffer-captured start_wallclock as authoritative.
-            # Recomputing (start_rtp/sample_rate + current rtp_system_offset) can drift
-            # because rtp_system_offset is an EMA that changes over time.
-            effective_start_wallclock = start_wallclock
+            # IMPORTANT: Prefer RTP-based wallclock if available.
+            # `start_wallclock` is the arrival time of the packet, which includes
+            # network jitter and buffering latency (typically ~25ms).
+            # `rtp_based_start_wallclock` uses the Smoothed Round Trip offset
+            # (or just average offset) which filters out jitter/lag.
             rtp_based_start_wallclock = None
-            if (effective_start_wallclock is None or effective_start_wallclock == 0.0) and start_rtp and start_rtp > 0:
+            if start_rtp and start_rtp > 0:
                 rtp_offset = self.rtp_system_offset.get(name)
                 if rtp_offset is not None:
+                    # RTP timestamp -> Wallclock using averaged offset
                     rtp_based_start_wallclock = (start_rtp / self.sample_rate) + rtp_offset
-                    effective_start_wallclock = rtp_based_start_wallclock
+            
+            # Decide which timestamp to use
+            if rtp_based_start_wallclock is not None:
+                effective_start_wallclock = rtp_based_start_wallclock
+                # logger.debug(f"  {name}: Using RTP-based wallclock (arrival_lag={start_wallclock - effective_start_wallclock:.3f}s)")
+            elif start_wallclock and start_wallclock > 0:
+                effective_start_wallclock = start_wallclock
+                logger.debug(f"  {name}: Using packet arrival wallclock (no RTP offset map)")
+            else:
+                effective_start_wallclock = None
             
             # Debug: show buffer state
             buffer_duration_s = len(samples) / self.sample_rate if len(samples) > 0 else 0
             if minute % 2 == 1:
-                logger.info(f"  {name}: odd_minute={buffer.odd_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}, start_rtp={start_rtp}, start_rtp_wallclock={(rtp_based_start_wallclock or 0.0):.1f}")
+                logger.info(f"  {name}: odd_minute={buffer.odd_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), effective_start={effective_start_wallclock or 0.0:.3f}")
             else:
-                logger.info(f"  {name}: even_minute={buffer.even_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), start_wallclock={start_wallclock:.1f}, start_rtp={start_rtp}, start_rtp_wallclock={(rtp_based_start_wallclock or 0.0):.1f}")
+                logger.info(f"  {name}: even_minute={buffer.even_minute}, requested={minute}, samples={len(samples)} ({buffer_duration_s:.1f}s), effective_start={effective_start_wallclock or 0.0:.3f}")
             
             min_needed = int(self.sample_rate * 55)  # Need most of the minute window
             if len(samples) < min_needed:
@@ -1495,14 +1524,14 @@ class LiveTimeEngine:
             # The tone is at second 0 of the target minute. The buffer should start
             # at :55 of the previous minute (5 seconds before the tone).
             # If start_wallclock is AFTER the minute boundary, we missed the tone.
-            minute_boundary = minute * 60
-            if effective_start_wallclock > minute_boundary:
-                seconds_late = effective_start_wallclock - minute_boundary
+            minute_boundary_float = float(minute * 60)
+            if effective_start_wallclock > minute_boundary_float:
+                seconds_late = effective_start_wallclock - minute_boundary_float
                 logger.warning(f"  {name}: Buffer started {seconds_late:.1f}s AFTER minute boundary - skipping (missed tone)")
                 continue
             
             # Also check if buffer is too early (started before :55 of prev minute)
-            expected_start = minute_boundary - 5.0
+            expected_start = minute_boundary_float - 5.0
             if effective_start_wallclock < expected_start - 1.0:  # Allow 1s tolerance
                 seconds_early = expected_start - effective_start_wallclock
                 logger.warning(f"  {name}: Buffer started {seconds_early:.1f}s too early - may have stale data")
@@ -1551,11 +1580,24 @@ class LiveTimeEngine:
                     system_time = float(minute * 60) - 5.0
                     logger.warning(f"  {name}: start_wallclock not set, using calculated system_time={system_time:.3f}")
                 
+                # Adaptive search window:
+                # If locked, narrow the search to expected location to reject noise.
+                # If acquiring, use wide window.
+                if self.clock_convergence.is_locked and self.clock_convergence.d_clock_ms is not None:
+                    current_search_window_ms = 200.0 # Narrow window when locked
+                    current_expected_offset_ms = self.clock_convergence.d_clock_ms
+                else:
+                    current_search_window_ms = 1500.0 # Wide window for acquisition
+                    current_expected_offset_ms = None
+                
                 # Run full Phase 2 analysis
                 phase2_result = engine.process_minute(
                     iq_samples=samples,
                     system_time=system_time,
-                    rtp_timestamp=start_rtp
+                    rtp_timestamp=start_rtp,
+                    minute_boundary=minute_boundary_float, # Pass minute boundary explicitly
+                    search_window_ms=current_search_window_ms,
+                    expected_offset_ms=current_expected_offset_ms
                 )
                 
                 if phase2_result and phase2_result.d_clock_ms is not None:
@@ -1616,17 +1658,33 @@ class LiveTimeEngine:
                     f"uncertainty={fusion_result.uncertainty_ms:.3f}ms"
                 )
 
-                allow_clock_update = (
-                    (
-                        fusion_result.n_broadcasts >= 3
-                        and fusion_result.uncertainty_ms <= 3.0
-                        and fusion_result.quality_grade in ('A', 'B', 'C')
-                    )
-                    or (
-                        fusion_result.n_broadcasts == 2
-                        and fusion_result.uncertainty_ms <= 0.5
-                    )
-                )
+                allow_clock_update = False
+
+                # GATING LOGIC (Revised 2025-12-12):
+                # We want to allow updates if:
+                # 1. We have robust multi-station fusion (n>=3, uncertainty<=3ms)
+                # 2. We have a decent dual-station consensus (n=2, uncertainty<=1ms)
+                # 3. We have ONE SINGLE high-quality station (uncertainty<=1.0ms, SNR high) 
+                #    - This enables users with only WWV or CHU to still converge!
+                
+                if fusion_result.n_broadcasts >= 3:
+                     # Robust fusion
+                     if fusion_result.uncertainty_ms <= 3.0:
+                         allow_clock_update = True
+                elif fusion_result.n_broadcasts == 2:
+                     # Dual station
+                     if fusion_result.uncertainty_ms <= 1.0:
+                         allow_clock_update = True
+                elif fusion_result.n_broadcasts == 1:
+                     # Single station - must be very high quality
+                     # e.g. WWV local graping or strong CHU
+                     # Require uncertainty < 1.0ms (implies very stable, clean signal)
+                     # BUG FIX (2025-12-12): Relax grade requirement since single station
+                     # often gets 'C' or 'D' purely due to count < 3.
+                     # Uncertainty is the real metric here.
+                     if fusion_result.uncertainty_ms <= 1.0:
+                         allow_clock_update = True
+                         logger.info(f"  Fusion: Allowing single-station update (U={fusion_result.uncertainty_ms:.2f}ms)")
 
                 if allow_clock_update:
                     raw_d_clock = fusion_result.d_clock_ms
@@ -1862,12 +1920,21 @@ class LiveTimeEngine:
             
             # FIX 2 (2025-12-11): Pre-filter physically implausible measurements
             # D_clock should be within ±100ms for a GPSDO-disciplined system.
-            # Values outside this range indicate tone detection failure (observed=0.00ms)
-            # which produces ~±5000ms offsets. Reject these before fusion.
-            if abs(d_clock_raw) > 100.0:
+            # However, during acquisition (unlocked), we must allow large offsets.
+            if self.clock_convergence.is_locked and abs(d_clock_raw) > 100.0:
                 logger.debug(f"  {broadcast_key}: REJECTED (d_clock={d_clock_raw:+.1f}ms outside ±100ms)")
                 n_prefilter_rejected += 1
+                
+                # Monitor systematic rejection (wrong basin)
+                self.consecutive_rejections += 1
+                if self.consecutive_rejections >= 5:
+                    logger.warning(f"  Fusion: {self.consecutive_rejections} consecutive rejections - resetting Kalman to re-acquire")
+                    self.clock_convergence.reset(initial_offset_ms=d_clock_raw)
+                    self.consecutive_rejections = 0
                 continue
+            
+            # Reset rejection counter if we found a valid candidate
+            self.consecutive_rejections = 0
 
             # Apply per-broadcast calibration (station+frequency).
             # This absorbs systematic biases that remain after propagation modeling
@@ -1926,8 +1993,46 @@ class LiveTimeEngine:
         
         if len(measurements) < 2:
             return None
+            
+        # FIX (2025-12-12): Global Anchor Enforcement
+        # Since all channels are sampled simultaneously by the same ADC, 
+        # relative timing differences > 100ms are physically impossible.
+        # We find the single strongest signal (SNR) and enforce its reality on all others.
         
+        # Sort by SNR (assuming SNR is stored/available, or calculate from weight)
+        # measurements tuple: (key, d_raw, d_cal, weight, station, freq)
+        # We don't have raw SNR in the tuple! I need to trace back to 'results'.
+        # Actually, 'weight' includes SNR factor. Max weight is a good proxy for "best signal".
+        
+        best_measurement = max(measurements, key=lambda m: m[3]) # Sort by weight
+        best_d_clock = best_measurement[2]
+        best_weight = best_measurement[3]
+        
+        # Only enforce if the anchor is reasonably strong (weight > 0.01 implies decent SNR/Conf)
+        # lowered from 0.1 to 0.01 (2025-12-12) to catch Grade D measurements
+        if best_weight > 0.01:
+            filtered_measurements = []
+            n_rejected_anchor = 0
+            
+            for m in measurements:
+                # Allowed deviation: 100ms (generous propagation variance + processing jitter)
+                if abs(m[2] - best_d_clock) <= 100.0:
+                    filtered_measurements.append(m)
+                else:
+                    n_rejected_anchor += 1
+            
+            if n_rejected_anchor > 0:
+                logger.info(f"  Global Anchor Rejection: Rejected {n_rejected_anchor} broadcasters "
+                           f"deviating >100ms from anchor {best_measurement[0]} (d={best_d_clock:+.1f}ms)")
+            
+            measurements = filtered_measurements
+            
+        if len(measurements) < 2:
+             # If we reduced to 1 measurement, pass it through (gated by uncertainty later)
+             pass
+
         # MAD-based outlier rejection
+
         d_calibrated = np.array([m[2] for m in measurements])
         weights = np.array([m[3] for m in measurements])
         
